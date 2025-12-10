@@ -1,0 +1,9 @@
+# Ignore build artifacts
+build/
+bin/
+obj/
+
+# Ignore generated logs and databases
+history.log
+*.exe
+*.dll
