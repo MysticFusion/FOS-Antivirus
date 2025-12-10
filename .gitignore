@@ -1,10 +1,48 @@
-# Ignore build artifacts
-build/
-bin/
-obj/
-*.vs/
-
-# Ignore generated logs and databases
-history.log
+# Build outputs
+*.o
+*.obj
 *.exe
+*.out
+*.elf
+*.a
+*.so
 *.dll
+bin/
+lib/
+build/
+build-*/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.cmake
+
+# Ninja
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Make / Autotools
+*.mk
+*.stamp
+
+# SCons
+.sconsign.dblite
+
+# IDE / Editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.cache
+*.db
+
+# Temp
+*.log
+*.tmp
+*.swp
+*.bak
