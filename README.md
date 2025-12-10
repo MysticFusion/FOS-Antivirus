@@ -35,3 +35,8 @@ To build from source, you need **MSYS2** installed on Windows with the following
    ```bash
    git clone https://github.com/MysticFusion/FOS-Antivirus.git
    cd FOS-Antivirus
+
+## 📥 Download
+
+Download the latest stable version here:  
+**https://github.com/MysticFusion/FOS-Antivirus/releases**
