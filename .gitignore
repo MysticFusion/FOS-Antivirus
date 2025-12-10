@@ -2,6 +2,7 @@
 build/
 bin/
 obj/
+.vs/
 
 # Ignore generated logs and databases
 history.log
