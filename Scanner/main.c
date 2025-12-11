@@ -359,7 +359,11 @@ GtkWidget *create_sidebar(AppState *app) {
     gtk_widget_set_margin_bottom(sett_group, 20);
 
     GtkWidget *sett_btn = create_nav_item(app, "preferences-system-symbolic", "Settings");
+    
+    // FIX: Use 'go_to_settings' which you already defined at line 268.
+    // Do NOT use 'on_nav_clicked' because it does not exist in your file.
     g_signal_connect(sett_btn, "clicked", G_CALLBACK(go_to_settings), app);
+    
     gtk_box_append(GTK_BOX(sett_group), sett_btn);
 
     gtk_box_append(GTK_BOX(sidebar), sett_group);
@@ -448,6 +452,99 @@ GtkWidget *create_advanced_scan_view(AppState *app) {
     return view;
 }
 
+// --- UPDATE UI LOGIC START ---
+
+static GtkWidget *update_dialog = NULL;
+static GtkWidget *update_progress_bar = NULL;
+static GtkWidget *update_status_label = NULL;
+
+// 1. Timer that updates the UI every 100ms
+static gboolean check_update_progress(gpointer user_data) {
+    if (!update_dialog) return G_SOURCE_REMOVE;
+
+    // Convert 0-100 int to 0.0-1.0 double
+    double fraction = (double)update_progress / 100.0;
+    if (fraction > 1.0) fraction = 1.0;
+    if (fraction < 0) fraction = 0;
+
+    gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(update_progress_bar), fraction);
+    
+    char buf[64];
+    if (update_progress < 100 && update_progress >= 0) {
+        snprintf(buf, 64, "Downloading Database... %d%%", update_progress);
+        gtk_label_set_text(GTK_LABEL(update_status_label), buf);
+    }
+
+    // Completion Check
+    if (update_progress == 101) {
+        gtk_label_set_text(GTK_LABEL(update_status_label), "Update Complete!");
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(update_progress_bar), 1.0);
+        
+        // Auto-close after 1.5 seconds
+        g_timeout_add(1500, (GSourceFunc)gtk_window_destroy, update_dialog);
+        update_dialog = NULL;
+        return G_SOURCE_REMOVE;
+    } 
+    // Error Check
+    else if (update_progress == -1) {
+        gtk_label_set_text(GTK_LABEL(update_status_label), "Error: Update Failed. Check Internet.");
+        // We leave the dialog open so the user sees the error
+        return G_SOURCE_REMOVE;
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
+// 2. The Button Click Handler
+static void on_update_clicked(GtkButton *btn, gpointer user_data) {
+    AppState *app = (AppState *)user_data;
+    
+    // Safety check
+    g_mutex_lock(&global_scan_ctx.mutex);
+    if (global_scan_ctx.is_running) {
+        g_mutex_unlock(&global_scan_ctx.mutex);
+        GtkAlertDialog *alert = gtk_alert_dialog_new("Cannot update while scanning.");
+        gtk_alert_dialog_show(alert, GTK_WINDOW(app->window));
+        return;
+    }
+    g_mutex_unlock(&global_scan_ctx.mutex);
+
+    // Create the Pop-up Window
+    update_dialog = gtk_window_new();
+    gtk_window_set_title(GTK_WINDOW(update_dialog), "Database Update");
+    gtk_window_set_modal(GTK_WINDOW(update_dialog), TRUE);
+    gtk_window_set_transient_for(GTK_WINDOW(update_dialog), GTK_WINDOW(app->window));
+    gtk_window_set_default_size(GTK_WINDOW(update_dialog), 350, 120);
+    
+    // Layout
+    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 15);
+    gtk_widget_set_margin_top(box, 25);
+    gtk_widget_set_margin_bottom(box, 25);
+    gtk_widget_set_margin_start(box, 25);
+    gtk_widget_set_margin_end(box, 25);
+    gtk_window_set_child(GTK_WINDOW(update_dialog), box);
+
+    // Label
+    update_status_label = gtk_label_new("Initializing connection...");
+    gtk_box_append(GTK_BOX(box), update_status_label);
+
+    // Progress Bar
+    update_progress_bar = gtk_progress_bar_new();
+    gtk_widget_set_size_request(update_progress_bar, 250, 25);
+    gtk_progress_bar_set_show_text(GTK_PROGRESS_BAR(update_progress_bar), TRUE);
+    gtk_box_append(GTK_BOX(box), update_progress_bar);
+
+    gtk_window_present(GTK_WINDOW(update_dialog));
+
+    // Start background thread
+    update_progress = 0;
+    g_thread_new("Updater", (GThreadFunc)update_signature_db, "signatures.db");
+
+    // Start UI Timer to watch progress
+    g_timeout_add(100, check_update_progress, NULL);
+}
+// --- UPDATE UI LOGIC END ---
+
 GtkWidget *create_settings_view(AppState *app) {
     GtkWidget *view = gtk_box_new(GTK_ORIENTATION_VERTICAL, 20);
     gtk_widget_set_margin_start(view, 30); gtk_widget_set_margin_top(view, 30); gtk_widget_set_margin_end(view, 30);
@@ -470,6 +567,33 @@ GtkWidget *create_settings_view(AppState *app) {
     gtk_widget_set_valign(GTK_WIDGET(sw), GTK_ALIGN_CENTER);
     gtk_box_append(GTK_BOX(card), GTK_WIDGET(sw));
     gtk_box_append(GTK_BOX(view), card);
+    
+    // --- Threat Signature Update Card ---
+    GtkWidget *update_card = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 20);
+    gtk_widget_add_css_class(update_card, "dashboard-card-bg");
+    gtk_widget_set_size_request(update_card, -1, 80);
+
+    // RENAMED variable to 'upd_lbl' to avoid redefinition error
+    GtkWidget *upd_lbl = gtk_label_new("Threat Signature Database");
+    gtk_widget_add_css_class(upd_lbl, "bold-text");
+    gtk_widget_set_halign(upd_lbl, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(upd_lbl, 20);
+    gtk_box_append(GTK_BOX(update_card), upd_lbl);
+    // RENAMED variable to 'upd_spacer' to avoid redefinition error
+    GtkWidget *upd_spacer = gtk_label_new(""); 
+    gtk_widget_set_hexpand(upd_spacer, TRUE); 
+    gtk_box_append(GTK_BOX(update_card), upd_spacer);
+
+    GtkWidget *upd_btn = gtk_button_new_with_label("Check for Updates");
+    gtk_widget_add_css_class(upd_btn, "scan-btn");
+    gtk_widget_set_margin_end(upd_btn, 20);
+    gtk_widget_set_valign(upd_btn, GTK_ALIGN_CENTER);
+
+    g_signal_connect(upd_btn, "clicked", G_CALLBACK(on_update_clicked), app);
+
+    gtk_box_append(GTK_BOX(update_card), upd_btn);
+    gtk_box_append(GTK_BOX(view), update_card);
+
     return view;
 }
 

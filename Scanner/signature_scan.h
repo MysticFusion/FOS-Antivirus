@@ -8,7 +8,8 @@
  * int signature_scan(const char *sigdb_path, const char *path_to_scan);
  * Returns 0 if scan completed, non-zero on fatal error.
  */
-
+extern volatile int update_progress;
 int signature_scan(const char *sigdb_path, const char *path_to_scan);
+int update_signature_db(const char *db_path);
 
 #endif

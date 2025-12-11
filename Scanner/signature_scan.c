@@ -8,7 +8,9 @@
 #include <time.h>
 #include <errno.h>
 #include <stdint.h>
-#include <windows.h> 
+#include <windows.h>
+#include <urlmon.h>
+#pragma comment(lib, "urlmon.lib")
 
 #define SHA256_SIZE 32
 #define HEXLEN (SHA256_SIZE * 2)
@@ -203,50 +205,360 @@ static void sigdb_free(sig_db *db) {
 }
 
 // --- Scanning Callback ---
-typedef struct { const sig_db *db; } scan_ctx;
+typedef struct {
+    sig_db *db; // Pointer to the loaded database (Original)
+    // --- NEW THREADING FIELDS ---
+    FilePathList *file_list;    // The list of all files to process (From scan_core.h)
+    gint current_index;         // Shared atomic counter for file list consumption
+    // ----------------------------
+    
+} scan_ctx;
 
-static int file_scan_cb(const char *path, const struct stat *st, void *ctxptr) {
-    (void)st;
-    scan_ctx *ctx = (scan_ctx *)ctxptr;
+extern int hash_equals(const unsigned char *a, const unsigned char *b);
+// The quarantine function is static, so we can call it directly
+// static int quarantine_file(const char *src_path, const char *threat_label);
+// The actual work function that runs in a separate thread (Phase 2).
+static gpointer worker_thread_scan(gpointer data) {
+    scan_ctx *ctx = (scan_ctx *)data;
+    
+    // Loop until the global index exceeds the total number of files
+    while (1) {
+        // Atomically increment and fetch the index for this file
+        // We fetch the index BEFORE incrementing, so index = 0, 1, 2, ...
+        gint file_index = g_atomic_int_add(&ctx->current_index, 1);
+        
+        if (file_index >= ctx->file_list->total_files) {
+            break; // All files have been claimed/processed
+        }
 
-    g_mutex_lock(&global_scan_ctx.mutex);
-    snprintf(global_scan_ctx.current_file, 255, "%s", path);
-    global_scan_ctx.files_scanned++;
-    if (global_scan_ctx.stop_requested) {
-        g_mutex_unlock(&global_scan_ctx.mutex);
-        return SCANCORE_FATAL_ERR; 
-    }
-    g_mutex_unlock(&global_scan_ctx.mutex);
-
-    unsigned char hash[SHA256_SIZE];
-    if (compute_file_sha256(path, hash) != 0) return SCANCORE_FILE_ERR;
-
-    for (size_t i = 0; i < ctx->db->count; ++i) {
-        if (hash_equals(hash, ctx->db->items[i].hash)) {
+        // Get the file path using the index.
+        char *path = (char*)g_list_nth_data(ctx->file_list->paths, file_index);
+        
+        if (path) {
             
+            // 1. Thread-safe check for stop request and UI update
             g_mutex_lock(&global_scan_ctx.mutex);
-            global_scan_ctx.threats_found++;
-            snprintf(global_scan_ctx.last_threat, 255, "%s", ctx->db->items[i].label);
+            if (global_scan_ctx.stop_requested) {
+                g_mutex_unlock(&global_scan_ctx.mutex);
+                return NULL; 
+            }
+            // Update UI context
+            snprintf(global_scan_ctx.current_file, 255, "%s", path);
+            global_scan_ctx.files_scanned++;
             g_mutex_unlock(&global_scan_ctx.mutex);
 
-            printf("\n[ALERT] THREAT FOUND: %s\n", path);
+            unsigned char hash[SHA256_SIZE];
+            // 2. Compute the hash
+            if (compute_file_sha256(path, hash) != 0) {
+                // Failed to hash (e.g., file locked/permission), continue to next file
+                continue; 
+            }
 
-            // New Quarantine Call
-            if (quarantine_file(path, ctx->db->items[i].label) == 0) {
-                return SCANCORE_HANDLED; 
-            } else {
-                return SCANCORE_MATCH; 
+            // 3. Check against database
+            for (size_t i = 0; i < ctx->db->count; ++i) {
+                if (hash_equals(hash, ctx->db->items[i].hash)) {
+                    
+                    // Threat found! Update UI context (thread-safe)
+                    g_mutex_lock(&global_scan_ctx.mutex);
+                    global_scan_ctx.threats_found++;
+                    snprintf(global_scan_ctx.last_threat, 255, "%s", ctx->db->items[i].label);
+                    g_mutex_unlock(&global_scan_ctx.mutex);
+
+                    printf("\n[ALERT] THREAT FOUND: %s\n", path);
+
+                    // 4. Quarantine
+                    if (quarantine_file(path, ctx->db->items[i].label) == 0) {
+                        // File successfully handled/quarantined
+                        // Since we found a match, stop checking this file against the rest of the DB
+                        break; 
+                    }
+                }
             }
         }
     }
-    return SCANCORE_OK;
+    return NULL;
 }
+
+// In signature_scan.c (REPLACE OLD SIGNATURE_SCAN FUNCTION)
+
+// [DELETE: static int file_scan_callback(const char *path, const struct stat *st, void *ctxptr) { ... }]
+
 
 int signature_scan(const char *sigdb_path, const char *path_to_scan) {
     sig_db db;
-    if (sigdb_load(&db, sigdb_path) != 0) return SCANCORE_FATAL_ERR;
-    scan_ctx ctx = { .db = &db };
-    int result = scan_path(path_to_scan, file_scan_cb, &ctx);
+    scan_ctx ctx;
+    int scan_result = -1;
+
+    // g_mutex_lock(&global_scan_ctx.mutex);
+    // if (global_scan_ctx.is_running) {
+    //     g_mutex_unlock(&global_scan_ctx.mutex);
+    //     return -1; // Already running
+    // }
+    // global_scan_ctx.is_running = true;
+    // global_scan_ctx.stop_requested = false;
+    // global_scan_ctx.files_scanned = 0;
+    // global_scan_ctx.threats_found = 0;
+    // g_mutex_unlock(&global_scan_ctx.mutex);
+
+
+    if (sigdb_load(&db, sigdb_path) != 0) {
+        MessageBoxA(NULL, "Failed to load signature database.", "Scan Error", MB_OK | MB_ICONERROR);
+        goto cleanup_db;
+    }
+
+    // --- Phase 1: Path Collection (Single-Threaded) ---
+    FilePathList *file_list = list_files_recursive(path_to_scan);
+    if (file_list == NULL || file_list->total_files == 0) {
+        // If no files were found (or error during listing)
+        scan_result = 0;
+        if (file_list) free_filepath_list(file_list);
+        goto cleanup_db;
+    }
+
+    // Initialize context for worker threads
+    ctx.db = &db;
+    ctx.file_list = file_list;
+    ctx.current_index = 0; 
+    
+    // --- Phase 2: Launch Worker Threads (Multi-Threaded Scan) ---
+    
+    // Determine the number of threads to use (Use CPU count for max speed)
+    // In signature_scan function
+    guint num_processors = g_get_num_processors();
+    // Use half the available cores, but at least 1
+    guint num_threads = MAX(1, num_processors / 2);
+    
+    // FIX: Allocate array dynamically using g_malloc to avoid C99 VLA/goto error.
+    GThread **threads = g_malloc(sizeof(GThread *) * num_threads); 
+    if (!threads) {
+        // If allocation fails, handle it gracefully before proceeding to thread launch
+        MessageBoxA(NULL, "Failed to allocate thread memory.", "Scan Error", MB_OK | MB_ICONERROR);
+        scan_result = -1; // Treat as fatal error
+        free_filepath_list(file_list);
+        goto cleanup_db;
+    }
+
+
+    for (guint i = 0; i < num_threads; ++i) {
+        threads[i] = g_thread_new(NULL, worker_thread_scan, &ctx);
+    }
+
+    // Wait for all threads to complete
+    for (guint i = 0; i < num_threads; ++i) {
+        g_thread_join(threads[i]);
+    }
+    // IMPORTANT: Free the dynamically allocated array
+    g_free(threads); 
+    // Check if the scan completed or was stopped
+    g_mutex_lock(&global_scan_ctx.mutex);
+    // ... (rest of the code is unchanged)
+
+    if (global_scan_ctx.stop_requested) {
+        scan_result = -2; // Scan stopped by user
+    } else {
+        scan_result = 0; // Scan completed
+    }
+    g_mutex_unlock(&global_scan_ctx.mutex);
+
+    // --- Cleanup ---
+    free_filepath_list(file_list);
+
+cleanup_db:
     sigdb_free(&db);
-    return result;
+    g_mutex_lock(&global_scan_ctx.mutex);
+    global_scan_ctx.is_running = false;
+    g_mutex_unlock(&global_scan_ctx.mutex);
+
+    return scan_result;
+}
+
+// Global progress variable definition
+volatile int update_progress = 0;
+
+// Helper: Quick structure check
+static int is_db_valid(const char *temp_path) {
+    FILE *f = fopen(temp_path, "r");
+    if (!f) return 0;
+    char line[128];
+    int valid_hashes = 0;
+    while (fgets(line, sizeof(line), f) && valid_hashes < 10) {
+        if (line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
+        if (strlen(line) >= 64) valid_hashes++; 
+    }
+    fclose(f);
+    return (valid_hashes > 0);
+}
+
+// --- COM Interface for Download Progress (C Style) ---
+typedef struct {
+    IBindStatusCallbackVtbl *lpVtbl;
+    long ref_count;
+} DownloadProgress;
+
+static HRESULT STDMETHODCALLTYPE QueryInterface(IBindStatusCallback* this, REFIID riid, void** ppvObject) {
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IBindStatusCallback)) {
+        *ppvObject = this;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE AddRef(IBindStatusCallback* this) { return 1; }
+static ULONG STDMETHODCALLTYPE Release(IBindStatusCallback* this) { return 1; }
+static HRESULT STDMETHODCALLTYPE OnStartBinding(IBindStatusCallback* this, DWORD dwReserved, IBinding* pib) { return S_OK; }
+static HRESULT STDMETHODCALLTYPE GetPriority(IBindStatusCallback* this, LONG* pnPriority) { return S_OK; }
+static HRESULT STDMETHODCALLTYPE OnLowResource(IBindStatusCallback* this, DWORD reserved) { return S_OK; }
+static HRESULT STDMETHODCALLTYPE OnStopBinding(IBindStatusCallback* this, HRESULT hresult, LPCWSTR szError) { return S_OK; }
+static HRESULT STDMETHODCALLTYPE GetBindInfo(IBindStatusCallback* this, DWORD* grfBINDF, BINDINFO* pbindinfo) { return S_OK; }
+static HRESULT STDMETHODCALLTYPE OnDataAvailable(IBindStatusCallback* this, DWORD grfBSCF, DWORD dwSize, FORMATETC* pformatetc, STGMEDIUM* pstgmed) { return S_OK; }
+static HRESULT STDMETHODCALLTYPE OnObjectAvailable(IBindStatusCallback* this, REFIID riid, IUnknown* punk) { return S_OK; }
+
+// The magic function that updates progress
+static HRESULT STDMETHODCALLTYPE OnProgress(IBindStatusCallback* this, ULONG ulProgress, ULONG ulProgressMax, ULONG ulStatusCode, LPCWSTR szStatusText) {
+    if (ulProgressMax > 0) {
+        update_progress = (int)((double)ulProgress / (double)ulProgressMax * 100.0);
+    }
+    return S_OK;
+}
+
+static IBindStatusCallbackVtbl progress_vtbl = {
+    QueryInterface, AddRef, Release, OnStartBinding, GetPriority, OnLowResource, 
+    OnProgress, OnStopBinding, GetBindInfo, OnDataAvailable, OnObjectAvailable
+};
+// --- FINAL FULL DATABASE UPDATE LOGIC ---
+
+int update_signature_db(const char *db_path) {
+    HRESULT coResult = CoInitialize(NULL);
+
+    // 1. URL for the FULL database (ZIP format)
+    const char *url = "https://bazaar.abuse.ch/export/txt/sha256/full/";
+    
+    char zip_path[MAX_PATH];
+    char extracted_name[] = "full_sha256.txt"; // The specific file inside their ZIP
+    char temp_db_path[MAX_PATH];
+    char backup_path[MAX_PATH];
+    char cmd_buf[512];
+    char debug_msg[256];
+
+    // Prepare paths: signatures.zip, signatures.db.tmp, signatures.db.old
+    snprintf(zip_path, MAX_PATH, "signatures.zip"); 
+    snprintf(temp_db_path, MAX_PATH, "%s.tmp", db_path);
+    snprintf(backup_path, MAX_PATH, "%s.old", db_path);
+
+    // Setup Progress Monitor
+    DownloadProgress progress_monitor;
+    progress_monitor.lpVtbl = &progress_vtbl;
+    progress_monitor.ref_count = 1;
+    update_progress = 0;
+
+    // 2. Download the ZIP file
+    HRESULT hr = URLDownloadToFileA(NULL, url, zip_path, 0, (IBindStatusCallback*)&progress_monitor);
+    progress_monitor.lpVtbl->Release((IBindStatusCallback*)&progress_monitor);
+
+    if (hr != S_OK) {
+        snprintf(debug_msg, 256, "Download Failed.\nError Code: 0x%08lX", hr);
+        MessageBoxA(NULL, debug_msg, "Update Error", MB_OK | MB_ICONERROR);
+        update_progress = -1;
+        CoUninitialize();
+        return -1;
+    }
+    // 3. UNZIP Phase (Silent Execution)
+    // We use CreateProcess instead of system() so we can hide the window (SW_HIDE).
+    
+    snprintf(cmd_buf, sizeof(cmd_buf), 
+             "powershell -NoProfile -WindowStyle Hidden -Command \"Expand-Archive -Path '%s' -DestinationPath . -Force\"", 
+             zip_path);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW; // Tell Windows we want to use the wShowWindow flag
+    si.wShowWindow = SW_HIDE;          // <--- THE KEY: Run completely invisible
+    
+    ZeroMemory(&pi, sizeof(pi));
+
+    // Launch the process
+    if (!CreateProcessA(NULL,   // No module name (use command line)
+                        cmd_buf,// Command line
+                        NULL,   // Process handle not inheritable
+                        NULL,   // Thread handle not inheritable
+                        FALSE,  // Set handle inheritance to FALSE
+                        0,      // No creation flags
+                        NULL,   // Use parent's environment block
+                        NULL,   // Use parent's starting directory
+                        &si,    // Pointer to STARTUPINFO structure
+                        &pi)    // Pointer to PROCESS_INFORMATION structure
+    ) {
+        MessageBoxA(NULL, "Could not start unzip process.", "Update Error", MB_OK | MB_ICONERROR);
+        DeleteFileA(zip_path);
+        update_progress = -1;
+        CoUninitialize();
+        return -5;
+    }
+
+    // Wait until child process exits.
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    // Check if it actually succeeded
+    DWORD exit_code = 0;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+
+    // Close process and thread handles. 
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exit_code != 0) {
+        MessageBoxA(NULL, "Unzip failed or was interrupted.", "Update Error", MB_OK | MB_ICONERROR);
+        DeleteFileA(zip_path);
+        update_progress = -1;
+        CoUninitialize();
+        return -5;
+    }
+
+    // 4. Rename extracted file (full_sha256.txt) to our temp DB name (signatures.db.tmp)
+    // First, delete any existing temp file to avoid collision
+    DeleteFileA(temp_db_path);
+    
+    if (!MoveFileA(extracted_name, temp_db_path)) {
+        // Try waiting a moment, sometimes antivirus scanning holds the new file
+        Sleep(500);
+        if (!MoveFileA(extracted_name, temp_db_path)) {
+             MessageBoxA(NULL, "Could not process extracted file.\nAccess Denied.", "Update Error", MB_OK | MB_ICONERROR);
+             update_progress = -1;
+             CoUninitialize();
+             return -6;
+        }
+    }
+    
+    // Clean up the zip file now that we have the content
+    DeleteFileA(zip_path);
+
+    // 5. Validation (Check if the extracted text file is valid)
+    update_progress = 90;
+    if (!is_db_valid(temp_db_path)) {
+        MessageBoxA(NULL, "Validation Failed: Extracted file is corrupt.", "Update Error", MB_OK | MB_ICONERROR);
+        DeleteFileA(temp_db_path);
+        update_progress = -1;
+        CoUninitialize();
+        return -2;
+    }
+
+    // 6. Safe Atomic Swap
+    if (GetFileAttributesA(db_path) != INVALID_FILE_ATTRIBUTES) {
+        CopyFileA(db_path, backup_path, FALSE);
+    }
+    
+    if (!MoveFileExA(temp_db_path, db_path, MOVEFILE_REPLACE_EXISTING)) {
+        MessageBoxA(NULL, "Final database swap failed.", "Update Error", MB_OK | MB_ICONERROR);
+        CopyFileA(backup_path, db_path, FALSE); // Restore
+        update_progress = -1;
+        CoUninitialize();
+        return -3;
+    }
+
+    // Success!
+    update_progress = 101;
+    CoUninitialize();
+    return 0;
 }

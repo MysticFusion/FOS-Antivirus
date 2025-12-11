@@ -29,4 +29,5 @@ set_target_properties(AntivirusUI PROPERTIES WIN32_EXECUTABLE true)
 target_link_libraries(AntivirusUI 
     ${GTK4_LIBRARIES}   # Links GTK4
     ws2_32              # Links Windows Sockets (Required by your backend makefile)
+    urlmon
 )
