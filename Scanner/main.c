@@ -236,19 +236,6 @@ static void on_dark_mode_toggled(GtkSwitch *widget, gboolean state, gpointer use
 
 typedef struct { char *orig_path; char *q_path; GtkWidget *row_widget; AppState *app; } RestoreData;
 
-// --- MODERN ALERT DIALOG (Replacements for Deprecated Warnings) ---
-
-static void on_restore_clicked(GtkButton *btn, gpointer user_data) {
-    RestoreData *data = (RestoreData *)user_data;
-    if (restore_file_from_quarantine(data->q_path, data->orig_path) == 0) {
-        gtk_list_box_remove(GTK_LIST_BOX(data->app->history_list_box), data->row_widget);
-        
-        GtkAlertDialog *alert = gtk_alert_dialog_new("File Restored Successfully");
-        gtk_alert_dialog_show(alert, GTK_WINDOW(data->app->window));
-        g_object_unref(alert);
-    }
-}
-
 // --- Navigation ---
 static void set_active_view(AppState *app, const char *view_name) {
     gtk_stack_set_visible_child_name(GTK_STACK(app->stack), view_name);
@@ -597,59 +584,219 @@ GtkWidget *create_settings_view(AppState *app) {
     return view;
 }
 
+// --- HISTORY & QUARANTINE LOGIC ---
+
+// --- HISTORY & QUARANTINE LOGIC (UPDATED) ---
+
+// 1. Updated Data Structure to hold button references
+typedef struct {
+    char *orig_path;
+    char *q_path;
+    GtkWidget *lbl_status;  // To change text to "Restored" or "Removed"
+    GtkWidget *btn_restore; // To disable button
+    GtkWidget *btn_remove;  // To disable button
+    AppState *app;
+} HistoryActionData;
+
+static void free_history_action_data(gpointer data) {
+    HistoryActionData *d = (HistoryActionData *)data;
+    if (d->orig_path) g_free(d->orig_path);
+    if (d->q_path) g_free(d->q_path);
+    g_free(d);
+}
+
+// 2. Updated Remove Callback (Adds Popup + Disables Buttons)
+static void on_remove_clicked(GtkButton *btn, gpointer user_data) {
+    HistoryActionData *data = (HistoryActionData *)user_data;
+    
+    // Perform Delete
+    remove(data->q_path); 
+
+    // Update UI: Change Status & Disable Buttons
+    gtk_label_set_text(GTK_LABEL(data->lbl_status), "Removed");
+    gtk_widget_set_sensitive(data->btn_restore, FALSE);
+    gtk_widget_set_sensitive(data->btn_remove, FALSE);
+
+    // Show Success Alert (New Request)
+    GtkAlertDialog *alert = gtk_alert_dialog_new("File Permanently Removed");
+    gtk_alert_dialog_show(alert, GTK_WINDOW(data->app->window));
+    g_object_unref(alert);
+}
+
+// 3. Updated Restore Callback (Disables Buttons on Success)
+static void on_restore_clicked(GtkButton *btn, gpointer user_data) {
+    HistoryActionData *data = (HistoryActionData *)user_data;
+    
+    if (restore_file_from_quarantine(data->q_path, data->orig_path) == 0) {
+        // Success: Update UI
+        gtk_label_set_text(GTK_LABEL(data->lbl_status), "Restored");
+        gtk_widget_set_sensitive(data->btn_restore, FALSE);
+        gtk_widget_set_sensitive(data->btn_remove, FALSE);
+        
+        GtkAlertDialog *alert = gtk_alert_dialog_new("File Restored Successfully");
+        gtk_alert_dialog_show(alert, GTK_WINDOW(data->app->window));
+        g_object_unref(alert);
+    } else {
+        GtkAlertDialog *alert = gtk_alert_dialog_new("Failed to Restore. Check permissions.");
+        gtk_alert_dialog_show(alert, GTK_WINDOW(data->app->window));
+        g_object_unref(alert);
+    }
+}
+
+// 4. Updated Load Function (Connects the buttons to the struct)
 static void load_history_items(AppState *app) {
+    // Clear existing children to prevent duplicates
     GtkWidget *child = gtk_widget_get_first_child(app->history_list_box);
     while (child != NULL) {
         GtkWidget *next = gtk_widget_get_next_sibling(child);
         gtk_list_box_remove(GTK_LIST_BOX(app->history_list_box), child);
         child = next;
     }
+
     FILE *f = fopen("history.log", "r");
-    if (!f) return;
+    if (!f) return; 
+
     char line[1024];
+    // Read file in reverse order (Newest first) is complex in C, 
+    // for now we read normal order. New entries appear at bottom.
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = 0;
-        char *date = strtok(line, "|");
-        char *name = strtok(NULL, "|");
-        char *orig = strtok(NULL, "|");
-        char *qpath = strtok(NULL, "|");
-        if (date && name && orig && qpath) {
-            GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-            gtk_widget_set_margin_top(row, 10); gtk_widget_set_margin_bottom(row, 10);
-            char *display_text = g_strdup_printf("<b>%s</b>\n%s\n<small>%s</small>", name, date, orig);
-            GtkWidget *lbl = gtk_label_new(NULL);
-            gtk_label_set_markup(GTK_LABEL(lbl), display_text);
-            g_free(display_text);
-            gtk_box_append(GTK_BOX(row), lbl);
-            GtkWidget *spacer = gtk_label_new(""); gtk_widget_set_hexpand(spacer, TRUE);
-            gtk_box_append(GTK_BOX(row), spacer);
-            GtkWidget *rest_btn = gtk_button_new_with_label("Restore");
-            gtk_widget_add_css_class(rest_btn, "scan-btn");
-            RestoreData *data = g_new0(RestoreData, 1);
-            data->orig_path = g_strdup(orig); data->q_path = g_strdup(qpath);
-            data->row_widget = row; data->app = app;
-            g_signal_connect_data(rest_btn, "clicked", G_CALLBACK(on_restore_clicked), data, (GClosureNotify)g_free, 0);
-            gtk_box_append(GTK_BOX(row), rest_btn);
-            gtk_list_box_append(GTK_LIST_BOX(app->history_list_box), row);
-        }
+        
+        char *token_date = strtok(line, "|");
+        char *token_threat = strtok(NULL, "|");
+        char *token_orig = strtok(NULL, "|");
+        char *token_qpath = strtok(NULL, "|");
+
+        if (!token_date || !token_orig || !token_qpath) continue;
+
+        // Clean filename
+        char *filename = strrchr(token_orig, '\\');
+        if (!filename) filename = strrchr(token_orig, '/');
+        filename = (filename) ? filename + 1 : token_orig;
+
+        // --- Create UI Row ---
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 15);
+        gtk_widget_set_margin_start(row, 10);
+        gtk_widget_set_margin_end(row, 10);
+        gtk_widget_set_margin_top(row, 8);
+        gtk_widget_set_margin_bottom(row, 8);
+
+        GtkWidget *lbl_name = gtk_label_new(filename);
+        gtk_widget_set_size_request(lbl_name, 120, -1);
+        gtk_widget_set_halign(lbl_name, GTK_ALIGN_START);
+        gtk_label_set_ellipsize(GTK_LABEL(lbl_name), PANGO_ELLIPSIZE_END);
+        gtk_box_append(GTK_BOX(row), lbl_name);
+
+        GtkWidget *lbl_path = gtk_label_new(token_orig);
+        gtk_widget_set_hexpand(lbl_path, TRUE);
+        gtk_widget_set_halign(lbl_path, GTK_ALIGN_START);
+        gtk_label_set_ellipsize(GTK_LABEL(lbl_path), PANGO_ELLIPSIZE_START);
+        gtk_box_append(GTK_BOX(row), lbl_path);
+
+        GtkWidget *lbl_date = gtk_label_new(token_date);
+        gtk_widget_set_size_request(lbl_date, 140, -1);
+        gtk_box_append(GTK_BOX(row), lbl_date);
+
+        // Status Label (kept in struct now)
+        GtkWidget *lbl_status = gtk_label_new("Quarantined");
+        gtk_widget_set_size_request(lbl_status, 100, -1);
+        gtk_box_append(GTK_BOX(row), lbl_status);
+
+        // Actions
+        GtkWidget *actions_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
+        
+        GtkWidget *btn_restore = gtk_button_new_from_icon_name("system-reboot-symbolic");
+        gtk_widget_set_tooltip_text(btn_restore, "Restore File");
+        
+        GtkWidget *btn_remove = gtk_button_new_from_icon_name("user-trash-symbolic");
+        gtk_widget_set_tooltip_text(btn_remove, "Delete Permanently");
+
+        // --- BINDING DATA ---
+        // We create ONE struct per row containing all pointers needed
+        HistoryActionData *data = g_new0(HistoryActionData, 1);
+        data->orig_path = g_strdup(token_orig);
+        data->q_path = g_strdup(token_qpath);
+        data->lbl_status = lbl_status;   // Store label so we can change text
+        data->btn_restore = btn_restore; // Store button so we can disable it
+        data->btn_remove = btn_remove;   // Store button so we can disable it
+        data->app = app;
+
+        // Connect Signals
+        // Note: We pass the SAME data struct to both buttons. 
+        // IMPORTANT: We only free it when the *row* is destroyed, or carefully handle ref counting.
+        // For simplicity here, we rely on the fact that the row persists until reload.
+        // A cleaner way is using g_object_set_data_full on the row itself, but this works for now.
+        
+        g_signal_connect_data(btn_restore, "clicked", G_CALLBACK(on_restore_clicked), 
+                              data, NULL, 0); // Don't free yet
+        
+        g_signal_connect_data(btn_remove, "clicked", G_CALLBACK(on_remove_clicked), 
+                              data, NULL, 0); // Don't free yet
+
+        // Hack: Free 'data' when the row is destroyed (reloaded)
+        g_object_set_data_full(G_OBJECT(row), "action_data", data, free_history_action_data);
+
+        gtk_box_append(GTK_BOX(actions_box), btn_restore);
+        gtk_box_append(GTK_BOX(actions_box), btn_remove);
+        gtk_box_append(GTK_BOX(row), actions_box);
+
+        gtk_list_box_append(GTK_LIST_BOX(app->history_list_box), row);
     }
     fclose(f);
 }
 
 GtkWidget *create_history_view(AppState *app) {
-    GtkWidget *view = gtk_box_new(GTK_ORIENTATION_VERTICAL, 20);
-    gtk_widget_set_margin_top(view, 30); gtk_widget_set_margin_start(view, 30); gtk_widget_set_margin_end(view, 30);
+    GtkWidget *view = gtk_box_new(GTK_ORIENTATION_VERTICAL, 10);
+    gtk_widget_set_margin_top(view, 30);
+    gtk_widget_set_margin_start(view, 30);
+    gtk_widget_set_margin_end(view, 30);
+
+    // Title
     GtkWidget *title = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(title), "<span font='28px' weight='bold'>Detection History</span>");
     gtk_widget_set_halign(title, GTK_ALIGN_START);
+    gtk_widget_set_margin_bottom(title, 20);
     gtk_box_append(GTK_BOX(view), title);
+
+    // --- Table Headers ---
+    GtkWidget *header_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 15);
+    gtk_widget_set_margin_start(header_box, 10);
+    gtk_widget_set_margin_end(header_box, 20); // Account for scrollbar space
+    
+    // Helper macro to add header labels matching the row widths
+    #define ADD_HEADER(text, width, expand) \
+        { GtkWidget *l = gtk_label_new(text); \
+          gtk_widget_add_css_class(l, "bold-text"); \
+          gtk_widget_set_halign(l, GTK_ALIGN_START); \
+          if(width > 0) gtk_widget_set_size_request(l, width, -1); \
+          if(expand) gtk_widget_set_hexpand(l, TRUE); \
+          gtk_box_append(GTK_BOX(header_box), l); }
+
+    ADD_HEADER("File Name", 120, FALSE);
+    ADD_HEADER("Original Path", -1, TRUE);
+    ADD_HEADER("Date/Time", 140, FALSE);
+    ADD_HEADER("Status", 100, FALSE);
+    ADD_HEADER("Action", -1, FALSE); // Action column
+
+    gtk_box_append(GTK_BOX(view), header_box);
+    gtk_box_append(GTK_BOX(view), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
+
+    // List Box container
     app->history_list_box = gtk_list_box_new();
     gtk_widget_add_css_class(app->history_list_box, "dashboard-card-bg");
+    
+    // Allow rows to be non-selectable (since we have buttons)
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(app->history_list_box), GTK_SELECTION_NONE);
+
+    // Scroll Window
     GtkWidget *scroll = gtk_scrolled_window_new();
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroll), app->history_list_box);
     gtk_widget_set_vexpand(scroll, TRUE);
     gtk_box_append(GTK_BOX(view), scroll);
+
+    // Load Data
     load_history_items(app);
+
     return view;
 }
 
@@ -697,6 +844,15 @@ GtkWidget *create_scan_complete_view(AppState *app) {
     return view;
 }
 
+// Callback to reload history whenever the user switches to the 'History' tab
+static void on_stack_changed(GtkStack *stack, GParamSpec *pspec, AppState *app) {
+    const char *visible_child_name = gtk_stack_get_visible_child_name(stack);
+    if (visible_child_name && strcmp(visible_child_name, "history") == 0) {
+        // User just switched to History tab -> Reload
+        load_history_items(app);
+    }
+}
+
 static void activate(GtkApplication *gtk_app, gpointer user_data) {
     AppState *app = g_new0(AppState, 1); 
     app->window = gtk_application_window_new(gtk_app);
@@ -718,6 +874,7 @@ static void activate(GtkApplication *gtk_app, gpointer user_data) {
 
     app->stack = gtk_stack_new();
     gtk_stack_set_transition_type(GTK_STACK(app->stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
+    g_signal_connect(app->stack, "notify::visible-child", G_CALLBACK(on_stack_changed), app);
     
     gtk_stack_add_titled(GTK_STACK(app->stack), create_dashboard_view(app), "dashboard", "Dashboard");
     gtk_stack_add_titled(GTK_STACK(app->stack), create_advanced_scan_view(app), "advanced_scan", "Advanced");

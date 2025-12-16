@@ -11,6 +11,8 @@ bin/
 lib/
 build/
 build-*/
+dist/
+dist-*/
 
 # CMake
 CMakeFiles/
