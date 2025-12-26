@@ -16,6 +16,10 @@ dist-*/
 dist.7z
 test/
 test*/
+z/
+z*/
+z-deploy/
+z-deploy*/
 
 # CMake
 CMakeFiles/
