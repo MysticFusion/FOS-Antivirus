@@ -61,7 +61,7 @@ def evaluate_tree(nodes, features):
 def run_inference(trees, features):
     import math
     total = sum(evaluate_tree(t, features) for t in trees)
-    log_odds = total / len(trees)
+    log_odds = total
     # Apply sigmoid to match ml_engine.c: 1 / (1 + exp(-log_odds))
     return 1.0 / (1.0 + math.exp(-log_odds))
 
@@ -126,7 +126,7 @@ MALWARE_FEATURES = make_malware_vector()
 
 def main():
     print("=" * 60)
-    print("  FOS-Antivirus1 — forest.bin Validator")
+    print("  FOS-Antivirus - forest.bin Validator")
     print("=" * 60)
 
     # ── 1. Locate model ───────────────────────────────────────────────────────
@@ -151,7 +151,7 @@ def main():
         print(f"[FAIL] Load error: {e}")
         sys.exit(1)
 
-    print(f"[OK]   Magic       : 0x{FOREST_MAGIC:08X} ('FORE') ✓")
+    print(f"[OK]   Magic       : 0x{FOREST_MAGIC:08X} ('FORE')")
     print(f"[OK]   Trees       : {num_trees}")
     print(f"[OK]   Features    : {num_features}")
 
@@ -163,7 +163,7 @@ def main():
     print(f"[OK]   Total nodes : {total_nodes:,}  (avg {avg_nodes:.1f} / tree)")
 
     # ── 3. Tree integrity ─────────────────────────────────────────────────────
-    print("\n── Tree Integrity Check ─────────────────────────────────────")
+    print("\n-- Tree Integrity Check -------------------------------------")
     errors = 0
     for i, nodes in enumerate(trees):
         leaf_count = sum(1 for n in nodes if n[0] == -1)
@@ -182,7 +182,7 @@ def main():
         print(f"[FAIL] {errors} tree(s) have structural problems")
 
     # ── 4. Inference test ─────────────────────────────────────────────────────
-    print("\n── Inference Test ───────────────────────────────────────────")
+    print("\n-- Inference Test -------------------------------------------")
     try:
         benign_score  = run_inference(trees, BENIGN_FEATURES)
         malware_score = run_inference(trees, MALWARE_FEATURES)
@@ -193,22 +193,22 @@ def main():
     benign_label  = "BENIGN"  if benign_score  < 0.5 else "MALWARE"
     malware_label = "MALWARE" if malware_score >= 0.5 else "BENIGN"
 
-    print(f"  Benign  sample score : {benign_score:.4f}  → {benign_label}")
-    print(f"  Malware sample score : {malware_score:.4f}  → {malware_label}")
+    print(f"  Benign  sample score : {benign_score:.4f}  -> {benign_label}")
+    print(f"  Malware sample score : {malware_score:.4f}  -> {malware_label}")
 
     ok_benign  = benign_score  < 0.5
     ok_malware = malware_score >= 0.5
 
     if ok_benign and ok_malware:
-        print("[OK]   Inference results are correct ✓")
+        print("[OK]   Inference results are correct")
     else:
         if not ok_benign:
-            print(f"[WARN] Benign sample scored too HIGH ({benign_score:.4f}) — model may be miscalibrated")
+            print(f"[WARN] Benign sample scored too HIGH ({benign_score:.4f}) - model may be miscalibrated")
         if not ok_malware:
-            print(f"[WARN] Malware sample scored too LOW ({malware_score:.4f}) — model may be miscalibrated")
+            print(f"[WARN] Malware sample scored too LOW ({malware_score:.4f}) - model may be miscalibrated")
 
     # ── 5. Score distribution (random probe) ──────────────────────────────────
-    print("\n── Score Distribution (1000 random samples) ─────────────────")
+    print("\n-- Score Distribution (1000 random samples) -----------------")
     rng = np.random.default_rng(42)
     # Random 2381-dim vectors in [0,1]
     rand_samples = rng.random((1000, NUM_FEATURES)).tolist()
@@ -220,17 +220,17 @@ def main():
     print(f"  Std   : {scores_arr.std():.4f}")
     histogram_bins = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     counts, _ = np.histogram(scores_arr, bins=histogram_bins)
-    print("  Histogram (score → count):")
+    print("  Histogram (score -> count):")
     for lo, hi, c in zip(histogram_bins, histogram_bins[1:], counts):
-        bar = "█" * (c // 10)
+        bar = "#" * (c // 10)
         print(f"    [{lo:.1f}-{hi:.1f}): {c:4d}  {bar}")
 
     # ── 6. Summary ────────────────────────────────────────────────────────────
-    print("\n── Summary ──────────────────────────────────────────────────")
+    print("\n-- Summary ---------------------------------------------------")
     if errors == 0 and ok_benign and ok_malware:
-        print("[PASS] forest.bin is valid and inference works correctly ✅")
+        print("[PASS] forest.bin is valid and inference works correctly")
     else:
-        print("[WARN] Some checks did not pass — review output above.")
+        print("[WARN] Some checks did not pass - review output above.")
 
 if __name__ == "__main__":
     main()

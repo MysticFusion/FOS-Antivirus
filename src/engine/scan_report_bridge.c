@@ -11,6 +11,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "scan_report_bridge.h"
+#include "app_paths.h"
 #include "response_engine.h"
 #include "scan_executor.h"
 #include "scan_progress.h"
@@ -61,7 +62,7 @@ extern volatile LONG g_pending_tasks;
  * @brief Log a suspicious heuristic event for later analysis.
  */
 static void log_heuristic_event(const char *path, const HeuristicResult *heur) {
-  FILE *f = fopen("heuristics.log", "a");
+  FILE *f = fopen(app_path_heuristics_log(), "a");
   if (f == NULL) {
     return;
   }
@@ -80,7 +81,7 @@ static void log_heuristic_event(const char *path, const HeuristicResult *heur) {
  * @brief Log generic detected threats to the central history log.
  */
 static void log_to_history(const char *path, const char *label) {
-  FILE *f = fopen("history.log", "a");
+  FILE *f = fopen(app_path_history_log(), "a");
   if (f == NULL) {
     return;
   }
@@ -133,7 +134,8 @@ static void dispatch_and_cleanup(scan_record *r) {
 
   bool threat_found = false;
 
-  if (decision.action == ACTION_QUARANTINE) {
+  if (decision.action == ACTION_QUARANTINE &&
+      !global_scan_ctx.stop_requested) {
     threat_found = true;
 
     const char *label = "Heuristic.Suspicious";
@@ -266,7 +268,8 @@ void scan_report_submit_complete(ScanInput *input, const SignatureResult *sig,
 
   bool threat_found = false;
 
-  if (decision.action == ACTION_QUARANTINE) {
+  if (decision.action == ACTION_QUARANTINE &&
+      !global_scan_ctx.stop_requested) {
     threat_found = true;
 
     /* Select most relevant label */

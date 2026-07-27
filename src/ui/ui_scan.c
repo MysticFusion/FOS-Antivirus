@@ -1,3 +1,4 @@
+
 /**
  * @file ui_scan.c
  * @brief Scanner UI Subsystem Implementation
@@ -7,7 +8,10 @@
  *
  */
 
+#define _CRT_SECURE_NO_WARNINGS
+
 #include "ui_scan.h"
+#include "app_paths.h"
 #include "signature_scan.h"
 
 #include "scan_core.h" 
@@ -31,6 +35,12 @@ typedef struct {
     char     *scan_arg;
 } ScanSequenceContext;
 
+/** @brief Context for posting scan errors to the GTK main thread */
+typedef struct {
+    AppState *app;
+    char     *error_message;
+} ScanErrorData;
+
 /* ============================================================================
  * Internal Prototypes
  * ========================================================================== */
@@ -40,7 +50,10 @@ static gpointer update_then_scan_worker(gpointer data);
 static gboolean start_scan_from_idle_cb(gpointer data);
 static gboolean on_scan_progress_tick(gpointer user_data);
 static void     on_folder_selected(GObject *source_object, GAsyncResult *res, gpointer user_data);
-static void     on_stop_scan(GtkButton *btn, gpointer user_data);
+static void     on_stop_or_back_clicked(GtkButton *btn, gpointer user_data);
+static void     on_back_home(GtkButton *btn, gpointer user_data);
+static void     post_scan_error(AppState *app, const char *msg);
+static gboolean show_scan_error_cb(gpointer user_data);
 
 /* ============================================================================
  * Scanning Workflow Logic
@@ -58,6 +71,15 @@ static gboolean on_scan_progress_tick(gpointer user_data)
     const char *current_file = scan_progress_current_file();
 
     char label_buffer[512] = "Scanning...";
+
+    /* If an error was posted (signature DB missing), freeze the UI */
+    if (app->scan_error) {
+        /* Don't update label; keep the error message. Stop pulsing. */
+        if (app->progress_bar)
+            gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->progress_bar), 0.0);
+        app->scan_view_active = FALSE;
+        return G_SOURCE_REMOVE; /* stop this timer */
+    }
 
     if (current_file != NULL && current_file[0] != '\0') {
         GError *error = NULL;
@@ -81,31 +103,72 @@ static gboolean on_scan_progress_tick(gpointer user_data)
     gtk_progress_bar_pulse(GTK_PROGRESS_BAR(app->progress_bar));
 
     /* Check for completion */
-    if (!still_running && scanned_count > 0) {
-        gchar *f_txt = g_strdup_printf("Files Scanned: %d", scanned_count);
-        gchar *t_txt = g_strdup_printf("Threats Found: %d", threat_count);
+    if (!still_running) {
+        if (scanned_count > 0) {
+            gchar *f_txt = g_strdup_printf("Files Scanned: %d", scanned_count);
+            gchar *t_txt = g_strdup_printf("Threats Found: %d", threat_count);
 
-        gtk_label_set_text(GTK_LABEL(app->result_files_label), f_txt);
-        gtk_label_set_text(GTK_LABEL(app->result_threats_label), t_txt);
+            gtk_label_set_text(GTK_LABEL(app->result_files_label), f_txt);
+            gtk_label_set_text(GTK_LABEL(app->result_threats_label), t_txt);
 
-        g_free(f_txt);
-        g_free(t_txt);
+            g_free(f_txt);
+            g_free(t_txt);
 
-        reload_history_view(app);
-        gtk_stack_set_visible_child_name(GTK_STACK(app->stack), "complete");
+            reload_history_view(app);
+            app->scan_view_active = FALSE;
+            gtk_stack_set_visible_child_name(GTK_STACK(app->stack), "complete");
+            return G_SOURCE_REMOVE;
+        }
+
+        /* Scan finished with zero files and no error posted yet —
+           either the error idle callback hasn't fired or it genuinely
+           finished with nothing to scan.  Give the error path a moment
+           to land; if scan_error is still false after a brief wait,
+           show a clean "no files" result. */
+        if (!app->scan_error) {
+            gtk_label_set_text(GTK_LABEL(app->result_files_label), "Files Scanned: 0");
+            gtk_label_set_text(GTK_LABEL(app->result_threats_label), "Threats Found: 0");
+            app->scan_view_active = FALSE;
+            gtk_stack_set_visible_child_name(GTK_STACK(app->stack), "complete");
+        }
         return G_SOURCE_REMOVE;
     }
 
-    return G_SOURCE_CONTINUE; 
+    return G_SOURCE_CONTINUE;
 }
 
 /**
- * @brief Background thread: Orchestrates the scan core logic.
+ * @brief Helper: Post a scan error to the main thread.
+ */
+static gboolean show_scan_error_cb(gpointer user_data)
+{
+    ScanErrorData *ed = (ScanErrorData *)user_data;
+    if (ed->app->progress_label)
+        gtk_label_set_text(GTK_LABEL(ed->app->progress_label), ed->error_message);
+    if (ed->app->progress_bar)
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(ed->app->progress_bar), 0.0);
+    ed->app->scan_error = TRUE;
+    ed->app->scan_view_active = FALSE;
+    g_free(ed->error_message);
+    g_free(ed);
+    return G_SOURCE_REMOVE;
+}
+
+static void post_scan_error(AppState *app, const char *msg)
+{
+    ScanErrorData *ed = g_new(ScanErrorData, 1);
+    ed->app = app;
+    ed->error_message = g_strdup(msg);
+    g_idle_add(show_scan_error_cb, ed);
+}
+
+/**
+ * @brief Background thread: Orchestrates the scan core logic with error handling.
  */
 static gpointer scan_worker_thread(gpointer user_data)
 {
-    char *mode = (char *)user_data; 
-    const char *db_path = "signatures.db"; 
+    char *mode = (char *)user_data;
+    const char *db_path = app_path_signature_db();
 
     /* Reset global synchronization context */
     g_mutex_lock(&global_scan_ctx.mutex);
@@ -116,37 +179,50 @@ static gpointer scan_worker_thread(gpointer user_data)
     memset(global_scan_ctx.current_file, 0, 256);
     g_mutex_unlock(&global_scan_ctx.mutex);
 
-    /* Disptach to appropriate scan type */
-    if (strcmp(mode, "QUICK_SCAN") == 0) {
-        GList *paths = get_quick_scan_paths();
-        for (GList *iter = paths; iter != NULL; iter = iter->next) {
-            char *folder = (char *)iter->data;
-            
-            /* Stop check */
-            g_mutex_lock(&global_scan_ctx.mutex);
-            bool aborted = global_scan_ctx.stop_requested;
-            g_mutex_unlock(&global_scan_ctx.mutex);
-            
-            if (aborted) break;
+    int result = SCANCORE_OK;
 
-            scan_core_start_scan(db_path, folder, false);
-        }
-        g_list_free_full(paths, g_free);
-    } else if (strcmp(mode, "FULL_SYSTEM") == 0) {
-        scan_core_start_scan(db_path, "C:\\Users", false);
+    /* Attempt to load the signature database; if missing, abort immediately */
+    if (signature_db_load(db_path) != 0) {
+        result = SCANCORE_FILE_ERR;
     } else {
-        /* Custom directory scan */
-        scan_core_start_scan(db_path, mode, false);
+        /* Dispatch to appropriate scan type */
+        if (strcmp(mode, "QUICK_SCAN") == 0) {
+            /* v1.2: Quick scan now uses scan_core_quick_scan() which performs:
+             *   1. Running process image scan (Phase B1)
+             *   2. Registry persistence target scan (Phase B2)
+             *   3. Targeted filesystem walk with extension + mtime filters (Phase A)
+             * This replaces the old approach of iterating get_quick_scan_paths()
+             * and calling scan_core_start_scan() for each. */
+            result = scan_core_quick_scan(db_path);
+        } else if (strcmp(mode, "FULL_SYSTEM") == 0) {
+            result = scan_core_start_scan(db_path, "C:\\Users", false, false);
+        } else {
+            /* Custom directory scan */
+            result = scan_core_start_scan(db_path, mode, false, false);
+        }
     }
 
-    /* Finalize tracking */
-    scan_progress_finish(); 
-    
+    if (result != SCANCORE_OK) {
+        AppState *app = NULL;
+        g_mutex_lock(&global_scan_ctx.mutex);
+        app = global_scan_ctx.app_state;
+        g_mutex_unlock(&global_scan_ctx.mutex);
+        if (app) {
+            post_scan_error(app,
+                "Scan failed: signature database not loaded.\n"
+                "Please update definitions in Settings.");
+        }
+        /* Mark progress as finished so the poller stops */
+        scan_progress_finish();
+    } else {
+        scan_progress_finish();
+    }
+
     g_mutex_lock(&global_scan_ctx.mutex);
     global_scan_ctx.is_running = false;
     g_mutex_unlock(&global_scan_ctx.mutex);
 
-    g_free(mode); 
+    g_free(mode);
     return NULL;
 }
 
@@ -154,7 +230,7 @@ static gboolean start_scan_from_idle_cb(gpointer data)
 {
     ScanSequenceContext *ctx = (ScanSequenceContext *)data;
     gtk_label_set_text(GTK_LABEL(ctx->app->progress_label), "Initializing...");
-    g_thread_new("Scanner", scan_worker_thread, ctx->scan_arg); 
+    g_thread_new("Scanner", scan_worker_thread, ctx->scan_arg);
     g_free(ctx);
     return G_SOURCE_REMOVE;
 }
@@ -162,17 +238,23 @@ static gboolean start_scan_from_idle_cb(gpointer data)
 static gpointer update_then_scan_worker(gpointer data)
 {
     ScanSequenceContext *ctx = (ScanSequenceContext *)data;
-    int res = update_signature_db("signatures.db");
-    
+    int res = update_signature_db(app_path_signature_db());
     if (res == 0) {
         time_t now = time(NULL);
         struct tm *tm_info = localtime(&now);
         strftime(last_update_time, sizeof(last_update_time), "%Y-%m-%d %H:%M", tm_info);
         save_settings();
         g_idle_add((GSourceFunc)refresh_last_update_label, ctx->app);
+        g_idle_add(start_scan_from_idle_cb, ctx);
+    } else {
+        /* v1.1.1: Use the full error message that includes the log path and
+         * any specific error from the Python aggregator. */
+        char full_err[1024];
+        update_get_full_error_message(full_err, sizeof(full_err));
+        post_scan_error(ctx->app, full_err);
+        g_free(ctx->scan_arg);
+        g_free(ctx);
     }
-    
-    g_idle_add(start_scan_from_idle_cb, ctx);
     return NULL;
 }
 
@@ -183,13 +265,14 @@ void start_scan_logic(AppState *app, char *path_or_mode)
     gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->progress_bar), 0.0);
     gtk_stack_set_visible_child_name(GTK_STACK(app->stack), "progress");
 
+    app->scan_error = FALSE;      /* reset error state */
+    app->scan_view_active = TRUE; /* mark scan view as active */
+
     if (auto_update_enabled && needs_update_today()) {
         gtk_label_set_text(GTK_LABEL(app->progress_label), "Checking for updates...");
-        
         ScanSequenceContext *ctx = g_new0(ScanSequenceContext, 1);
         ctx->app = app;
         ctx->scan_arg = thread_safe_arg;
-
         g_thread_new("UpdateThenScan", update_then_scan_worker, ctx);
     } else {
         gtk_label_set_text(GTK_LABEL(app->progress_label), "Initializing...");
@@ -214,7 +297,7 @@ static void on_folder_selected(GObject *source_object, GAsyncResult *res, gpoint
 
     if (folder != NULL) {
         char *path = g_file_get_path(folder);
-        if (path) start_scan_logic(app, path); 
+        if (path) start_scan_logic(app, path);
         g_object_unref(folder);
     } else {
         if (error) g_error_free(error);
@@ -234,16 +317,33 @@ static void on_browse_clicked(GtkButton *btn, gpointer user_data)
 static void on_back_home(GtkButton *btn, gpointer user_data)
 {
     (void)btn;
-    gtk_stack_set_visible_child_name(GTK_STACK(((AppState*)user_data)->stack), "dashboard");
+    AppState *app = (AppState *)user_data;
+    app->scan_view_active = FALSE;   /* scan results acknowledged */
+    app->scan_error = FALSE;        /* clear any error */
+    gtk_stack_set_visible_child_name(GTK_STACK(app->stack), "dashboard");
 }
 
-static void on_stop_scan(GtkButton *btn, gpointer user_data)
+/**
+ * @brief Handler for the "Cancel Scan" / "Back to Dashboard" button.
+ */
+static void on_stop_or_back_clicked(GtkButton *btn, gpointer user_data)
 {
     (void)btn;
-    (void)user_data;
+    AppState *app = (AppState *)user_data;
     g_mutex_lock(&global_scan_ctx.mutex);
-    global_scan_ctx.stop_requested = true;
+    bool running = global_scan_ctx.is_running;
     g_mutex_unlock(&global_scan_ctx.mutex);
+    if (running) {
+        /* Request stop */
+        g_mutex_lock(&global_scan_ctx.mutex);
+        global_scan_ctx.stop_requested = true;
+        g_mutex_unlock(&global_scan_ctx.mutex);
+    } else {
+        /* Not running, so user can return to dashboard and dismiss error/result */
+        app->scan_view_active = FALSE;
+        app->scan_error = FALSE;
+        gtk_stack_set_visible_child_name(GTK_STACK(app->stack), "dashboard");
+    }
 }
 
 GtkWidget *create_advanced_scan_view(AppState *app)
@@ -327,7 +427,7 @@ GtkWidget *create_scanner_progress_view(AppState *app)
     gtk_widget_add_css_class(stop_btn, "destructive-action");
     gtk_widget_set_halign(stop_btn, GTK_ALIGN_CENTER);
     gtk_widget_set_size_request(stop_btn, 140, 38);
-    g_signal_connect(stop_btn, "clicked", G_CALLBACK(on_stop_scan), app);
+    g_signal_connect(stop_btn, "clicked", G_CALLBACK(on_stop_or_back_clicked), app);
     gtk_box_append(GTK_BOX(inner), stop_btn);
 
     gtk_box_append(GTK_BOX(card), inner);
@@ -363,7 +463,7 @@ GtkWidget *create_scan_complete_view(AppState *app)
     gtk_widget_add_css_class(home_btn, "scan-btn");
     gtk_widget_set_margin_top(home_btn, 10);
     g_signal_connect(home_btn, "clicked", G_CALLBACK(on_back_home), app);
-    gtk_box_append(GTK_BOX(card), home_btn);
+    gtk_box_append(GTK_BOX(view), home_btn);
 
     gtk_box_append(GTK_BOX(view), card);
     return view;

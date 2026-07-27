@@ -141,8 +141,8 @@ double ml_engine_scan(const FileFeatures *features) {
   for (uint32_t i = 0; i < g_forest->num_trees; i++) {
     total_score += evaluate_tree(&g_forest->trees[i], features->vector);
   }
-  /* LightGBM leaf values are raw log-odds.  Average them then apply
+  /* LightGBM leaf values are raw log-odds. Sum them then apply
      the sigmoid to produce a calibrated [0, 1] malware probability. */
-  double log_odds = (double)(total_score / (float)g_forest->num_trees);
+  double log_odds = (double)total_score;
   return 1.0 / (1.0 + exp(-log_odds));
 }

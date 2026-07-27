@@ -1,71 +1,124 @@
-cmake_minimum_required(VERSION 3.17)
-project(AntivirusFYP C)
+# 1. Specify the minimum version of CMake required
+cmake_minimum_required(VERSION 3.10)
 
-set(CMAKE_C_STANDARD 11)
+# 2. Name your project and specify the language
+project(FOS_Antivirus C)
 
-# 1. Find GTK4 (Frontend)
+include(CTest)
+
+# --- NEW: Find PkgConfig, GTK, and SQLite ---
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(GTK4 REQUIRED gtk4)
+# Note: If your code is specifically written for GTK4
+pkg_check_modules(GTK REQUIRED IMPORTED_TARGET gtk4)
+find_package(SQLite3 REQUIRED)
+# -----------------------------------
 
-# 2. Include Directories
-# We include src/ as the root for simpler include paths
-include_directories(
-    src
-    src/app
-    src/engine
-    src/ui
-    ${GTK4_INCLUDE_DIRS}
+# 3. Organize source files into variables for readability
+set(MAIN_SOURCE src/main.c)
+
+set(APP_SOURCES
+    src/app/app.c
+    src/app/app_paths.c
+    src/app/auto_update.c
 )
 
-link_directories(${GTK4_LIBRARY_DIRS})
-add_definitions(${GTK4_CFLAGS_OTHER})
-
-# 3. Add Executable
-add_executable(Antivirus 
-    src/main.c
-    src/app/app.c
-    # UI Files
-    src/ui/ui_scan_paths.c
-    src/ui/ui_sidebar.c
-    src/ui/ui_views.c
-    src/ui/ui_scan.c
-    src/ui/ui_history.c
-    src/ui/ui_update.c
-    # Engine Files
-    src/engine/scan_core.c
-    src/engine/hash_util.c
-    src/engine/fs_enumerator.c
-    src/engine/sha2.c
-    src/engine/signature_scan.c
+set(ENGINE_SOURCES
     src/engine/feature_extract.c
+    src/engine/fs_enumerator.c
+    src/engine/hash_util.c
     src/engine/heuristic_engine.c
-    src/engine/scan_report_bridge.c
-    src/engine/scan_executor.c
+    src/engine/ml_engine.c
     src/engine/response_engine.c
     src/engine/rt_monitor.c
-    src/engine/trust.c
+    src/engine/scan_core.c
+    src/engine/scan_executor.c
+    src/engine/scan_persistence.c
+    src/engine/scan_processes.c
     src/engine/scan_progress.c
-    src/engine/ml_engine.c
+    src/engine/scan_report_bridge.c
+    src/engine/sha2.c
+    src/engine/signature_scan.c
+    src/engine/signature_scan_sqlite.c
+    src/engine/trust.c
 )
 
-# 4. Link Libraries
-target_link_libraries(Antivirus 
-    ${GTK4_LIBRARIES}
-    ws2_32
+set(UI_SOURCES
+    src/ui/ui_history.c
+    src/ui/ui_scan_paths.c
+    src/ui/ui_scan.c
+    src/ui/ui_sidebar.c
+    src/ui/ui_update.c
+    src/ui/ui_views.c
+)
+
+# 4. Tell CMake to create an executable from all these source files
+add_executable(FOS-Antivirus WIN32
+    ${MAIN_SOURCE}
+    ${APP_SOURCES}
+    ${ENGINE_SOURCES}
+    ${UI_SOURCES}
+)
+
+# 5. Tell the compiler where to look for header (.h) files
+target_include_directories(FOS-Antivirus PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/app
+    ${CMAKE_SOURCE_DIR}/src/engine
+    ${CMAKE_SOURCE_DIR}/src/ui
+)
+
+# --- NEW: Link GTK and SQLite to your executable ---
+# This automatically handles the include paths and linker flags for GTK and SQLite
+target_link_libraries(FOS-Antivirus PRIVATE
+    PkgConfig::GTK
+    SQLite3::SQLite3
+    shlwapi
     urlmon
     wintrust
-    crypt32
-    shlwapi
     shell32
     ole32
     oleaut32
+    uuid
+    advapi32
+    wininet
+    psapi
+)
+# ----------------------------------------
+
+# Stage the Python aggregator script next to the EXE so update_signature_db()
+# can find it at runtime. Looks for it in <exe_dir>/scripts/hash_aggregator.py.
+add_custom_command(TARGET FOS-Antivirus POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:FOS-Antivirus>/scripts"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/scripts/hash_aggregator.py"
+            "$<TARGET_FILE_DIR:FOS-Antivirus>/scripts/hash_aggregator.py"
+    COMMENT "Staging hash aggregator script"
 )
 
-# 5. Post-Build: Copy Resources (Model & Database)
-add_custom_command(TARGET Antivirus POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/ml/models
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
-        ${CMAKE_SOURCE_DIR}/assets/models/forest.bin
-        ${CMAKE_BINARY_DIR}/ml/models/forest.bin
-    COMMENT "Copying ML Resources to Build Directory"
+add_custom_command(TARGET FOS-Antivirus POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:FOS-Antivirus>/ml/models"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/assets/models/forest.bin"
+            "$<TARGET_FILE_DIR:FOS-Antivirus>/ml/models/forest.bin"
+    COMMENT "Staging ML model assets"
 )
+
+# Optional: Add standard compiler flags for warnings
+if(MSVC)
+    target_compile_options(FOS-Antivirus PRIVATE /W3 /WX-)
+else()
+    target_compile_options(FOS-Antivirus PRIVATE -Wall -Wextra)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(decision_policy_test
+        tests/decision_policy_test.c
+        src/engine/scan_executor.c
+    )
+    target_include_directories(decision_policy_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/engine
+    )
+    add_test(NAME decision_policy_test COMMAND decision_policy_test)
+endif()

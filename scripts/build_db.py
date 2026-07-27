@@ -1,5 +1,6 @@
 import sqlite3
 import time
+import argparse
 from pathlib import Path
 
 # Try to use orjson for blazing fast parsing. Fallback to standard json if missing.
@@ -113,6 +114,16 @@ def ingest_directory_to_sqlite(directory_path, db_path, table_name, batch_size=1
     print(f"✅ Finished '{table_name}'. Inserted {total_rows_inserted:,} rows from {len(jsonl_files)} files. Time: {elapsed:.2f}s!")
 
 if __name__ == "__main__":
-    # Point these to your directories
-    ingest_directory_to_sqlite('D:/win32_train', 'D:/train_data.db', 'win32')
-    ingest_directory_to_sqlite('D:/win64_train', 'D:/train_data.db', 'win64')
+    parser = argparse.ArgumentParser(
+        description="Ingest win32/win64 JSONL training data into SQLite."
+    )
+    parser.add_argument("--db", required=True, help="Output SQLite database path.")
+    parser.add_argument("--win32-dir", required=True, help="Directory containing win32 .jsonl files.")
+    parser.add_argument("--win64-dir", required=True, help="Directory containing win64 .jsonl files.")
+    parser.add_argument("--win32-table", default="win32", help="SQLite table name for win32 rows.")
+    parser.add_argument("--win64-table", default="win64", help="SQLite table name for win64 rows.")
+    parser.add_argument("--batch-size", type=int, default=100000, help="Insert batch size.")
+    args = parser.parse_args()
+
+    ingest_directory_to_sqlite(args.win32_dir, args.db, args.win32_table, args.batch_size)
+    ingest_directory_to_sqlite(args.win64_dir, args.db, args.win64_table, args.batch_size)

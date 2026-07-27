@@ -6,6 +6,16 @@
  * It provides high-level APIs for scanning individual files or recursive
  * directory trees.
  *
+ * v1.2 changes:
+ *   - scan_core_start_scan() now takes a quick_mode parameter.
+ *   - New scan_core_quick_scan() function that performs the full quick-scan
+ *     workflow: (1) scan all running process images, (2) scan registry
+ *     persistence target files, (3) walk targeted filesystem paths with
+ *     extension whitelist + mtime filtering.
+ *   - Extension whitelist filter is ALWAYS active (all scan modes) — non-
+ *     executable files (.txt, .jpg, .log, etc.) are never scanned.
+ *   - mtime filter is active only in quick_mode — files older than 30 days
+ *     in non-persistence locations are skipped.
  */
 
 #ifndef SCAN_CORE_H
@@ -20,6 +30,8 @@ extern "C" {
 #include <glib.h>
 #include "feature_extract.h"
 #include "trust.h"
+
+typedef struct _AppState AppState;
 
 /* ============================================================================
  * Return Codes
@@ -65,6 +77,7 @@ typedef struct {
     int  files_scanned;
     int  threats_found;
     char current_file[256];
+    AppState *app_state;
 } ScanContext;
 
 extern ScanContext global_scan_ctx;
@@ -79,14 +92,35 @@ extern ScanContext global_scan_ctx;
  * @param[in] sigdb_path    Path to the signature database.
  * @param[in] path_to_scan  Directory or file path to scan.
  * @param[in] low_priority  If true, throttles resource usage to minimize system impact.
+ * @param[in] quick_mode    If true, applies mtime filtering and uses fast trust
+ *                          evaluation (no revocation checks). If false, uses
+ *                          full trust evaluation and no mtime filtering.
  *
  * @return 0 on success, negative error code on failure.
  */
 int scan_core_start_scan(
     const char *sigdb_path,
     const char *path_to_scan,
-    bool        low_priority
+    bool        low_priority,
+    bool        quick_mode
 );
+
+/**
+ * @brief Perform a full quick scan (Phase A + Phase B).
+ *
+ * This is the recommended entry point for quick scan. It performs:
+ *   1. Scan all running process images (Phase B1 — EnumProcesses + EnumProcessModulesEx)
+ *   2. Scan registry persistence target files (Phase B2 — Run/RunOnce/Winlogon/IFEO)
+ *   3. Walk targeted filesystem paths with extension whitelist + mtime filtering
+ *      (Phase A — System32, Program Files, Startup, Downloads, Temp, etc.)
+ *
+ * All three steps use the same scan pipeline (signature DB + heuristics + ML)
+ * and share a single progress tracking session.
+ *
+ * @param[in] sigdb_path Path to the signature database.
+ * @return 0 on success, negative error code on failure.
+ */
+int scan_core_quick_scan(const char *sigdb_path);
 
 /**
  * @brief Scan a single file immediately (typically used for real-time events).

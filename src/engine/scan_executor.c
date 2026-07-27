@@ -119,8 +119,8 @@ void execute_scan_decision(
      * ML should ONLY MONITOR, NEVER QUARANTINE. This prevents false
      * positives on legitimate software.
      *
-     * When a properly trained model is available, this can be changed to
-     * ACTION_QUARANTINE for high-confidence detections.
+     * Keep ML-only detections monitor-only until feature parity and model
+     * calibration are proven with representative validation data.
      */
     if (ml_score >= 0.0 && ml_score > ML_SCORE_THRESHOLD) {
         set_decision(out, ACTION_MONITOR, "AI/ML behavioral analysis (monitoring)");

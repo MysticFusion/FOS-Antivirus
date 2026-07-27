@@ -13,17 +13,12 @@
 extern "C" {
 #endif
 
-/* ============================================================================
- * Data Structures
- * ========================================================================== */
-
 /**
- * @brief Container for a list of discovered file paths.
+ * @brief Callback function type for file discovery.
+ * @param path The absolute path of the discovered file.
+ * @param user_data Opaque pointer to user-defined data.
  */
-typedef struct {
-    char **paths; /**< Array of heap-allocated strings */
-    int    count; /**< Number of paths in the list */
-} FilePathList;
+typedef void (*fs_enum_callback_t)(const char *path, void *user_data);
 
 /* ============================================================================
  * Public Functions
@@ -32,22 +27,17 @@ typedef struct {
 /**
  * @brief Discover all files in a directory and its subdirectories.
  *
- * @param[in]  root     Starting directory path.
- * @param[out] out_list List to populate with found file paths.
+ * @param[in]  root       Starting directory path.
+ * @param[in]  callback   Function to call for each discovered file.
+ * @param[in]  user_data  User data to pass to the callback.
  *
  * @return 0 on success, non-zero on error.
  */
 int list_files_recursive(
-    const char   *root,
-    FilePathList *out_list
+    const char         *root,
+    fs_enum_callback_t  callback,
+    void               *user_data
 );
-
-/**
- * @brief Release memory allocated for a FilePathList.
- *
- * @param[in] list List to clean up.
- */
-void free_filepath_list(FilePathList *list);
 
 #ifdef __cplusplus
 }

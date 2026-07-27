@@ -1,10 +1,8 @@
 import lightgbm as lgb
 import struct
-import json
 import os
+import argparse
 
-LGB_MODEL_PATH = "assets/models/forest.txt"
-OUTPUT_BIN_PATH = "assets/models/forest.bin"
 MAGIC = b'FORE'
 NUM_FEATURES = 2381
 
@@ -41,12 +39,17 @@ def flatten_lgb_tree(tree_structure):
     return nodes
 
 def main():
-    if not os.path.exists(LGB_MODEL_PATH):
-        print(f"Error: {LGB_MODEL_PATH} not found.")
+    parser = argparse.ArgumentParser(description="Export a LightGBM model to the FOS FORE binary format.")
+    parser.add_argument("--model", default="assets/models/forest.txt", help="Input LightGBM text model.")
+    parser.add_argument("--out", default="assets/models/forest.bin", help="Output FORE binary model.")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.model):
+        print(f"Error: {args.model} not found.")
         return
         
-    print(f"Loading LightGBM model from {LGB_MODEL_PATH}...")
-    booster = lgb.Booster(model_file=LGB_MODEL_PATH)
+    print(f"Loading LightGBM model from {args.model}...")
+    booster = lgb.Booster(model_file=args.model)
     
     dump = booster.dump_model()
     trees = dump['tree_info']
@@ -54,10 +57,10 @@ def main():
     
     print(f"Parsed {n_trees} trees. Converting to binary format...")
     
-    out_dir = os.path.dirname(OUTPUT_BIN_PATH)
+    out_dir = os.path.dirname(args.out)
     if out_dir: os.makedirs(out_dir, exist_ok=True)
     
-    with open(OUTPUT_BIN_PATH, 'wb') as f:
+    with open(args.out, 'wb') as f:
         # Header
         f.write(MAGIC)
         f.write(struct.pack('<II', n_trees, NUM_FEATURES))
@@ -79,7 +82,7 @@ def main():
                                     node['value']))
                                     
     print(f"Export successful!")
-    print(f"Wrote {n_trees} trees and {total_nodes} total nodes to {OUTPUT_BIN_PATH}.")
+    print(f"Wrote {n_trees} trees and {total_nodes} total nodes to {args.out}.")
 
 if __name__ == '__main__':
     main()

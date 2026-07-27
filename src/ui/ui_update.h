@@ -5,6 +5,9 @@
  * Provides functions for checking, triggering, and monitoring malware
  * database updates both automatically and manually.
  *
+ * v1.2.1: Added db_is_older_than() to gate silent background updates on
+ * actual DB staleness, preventing python.exe from spawning on every app
+ * launch when the DB is already fresh.
  */
 
 #ifndef UI_UPDATE_H
@@ -28,6 +31,24 @@ extern "C" {
 gboolean needs_update_today(void);
 
 /**
+ * @brief Check if the last successful DB update is older than the given
+ *        number of hours.
+ *
+ * Parses the global `last_update_time` string (format "YYYY-MM-DD HH:MM")
+ * and compares it to the current time. Returns TRUE if:
+ *   - last_update_time is "Never" (never updated), OR
+ *   - the parsed timestamp is older than `hours` hours ago, OR
+ *   - the timestamp can't be parsed (treat as stale — safer to update).
+ *
+ * Used to gate silent background updates so python.exe doesn't spawn on
+ * every app launch when the DB is already fresh.
+ *
+ * @param hours  Threshold in hours (e.g., 168 = 7 days, 24 = 1 day).
+ * @return TRUE if the DB is stale (older than `hours` or never updated).
+ */
+gboolean db_is_older_than(int hours);
+
+/**
  * @brief Refresh the "Last Updated" timestamp label in the UI.
  * @param data Pointer to AppState.
  */
@@ -35,6 +56,10 @@ gboolean refresh_last_update_label(gpointer data);
 
 /**
  * @brief GLib timer function for periodic silent updates.
+ *
+ * v1.2.1: Only fires the background updater if the DB is older than 24
+ * hours (checked via db_is_older_than(24)). This prevents redundant
+ * python.exe spawns when the DB is already fresh.
  */
 gboolean auto_update_timer(gpointer user_data);
 

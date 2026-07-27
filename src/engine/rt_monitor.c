@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 
+#include "app_paths.h"
 #include "rt_monitor.h"
 #include "scan_core.h"
 #include "signature_scan.h"
@@ -18,7 +19,7 @@
  * Configuration & Thresholds
  * ========================================================================== */
 
-#define RT_BUFFER_SIZE 8192
+#define RT_BUFFER_SIZE 65536
 #define MAX_PATH_W 1024
 #define BURST_WINDOW_SEC 2
 #define BURST_THRESHOLD 5
@@ -41,6 +42,18 @@ static int g_burst_head = 0;
 /* Log Deduplication State */
 static char g_last_log_path[MAX_PATH] = {0};
 static time_t g_last_log_time = 0;
+
+static void rt_log_event(const char *message) {
+  FILE *f = fopen(app_path_heuristics_log(), "a");
+  if (f == NULL)
+    return;
+
+  time_t now = time(NULL);
+  char ts[64];
+  strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
+  fprintf(f, "[%s] RT-MONITOR=%s\n", ts, message);
+  fclose(f);
+}
 
 /* ============================================================================
  * Internal Helpers
@@ -79,7 +92,18 @@ static DWORD WINAPI rt_thread_proc(LPVOID param) {
                                    FILE_NOTIFY_CHANGE_SIZE |
                                    FILE_NOTIFY_CHANGE_LAST_WRITE,
                                &bytes, NULL, NULL)) {
-      break;
+      if (!g_rt_running || GetLastError() == ERROR_OPERATION_ABORTED) {
+        break;
+      }
+      rt_log_event("ReadDirectoryChangesW failed; backing off");
+      Sleep(1000); // Back off on overflow or error
+      continue;
+    }
+
+    if (bytes == 0) {
+      rt_log_event("directory change buffer overflow or empty event batch");
+      Sleep(500); // Buffer overflow
+      continue;
     }
 
     FILE_NOTIFY_INFORMATION *fni = (FILE_NOTIFY_INFORMATION *)buffer;
@@ -133,6 +157,7 @@ static DWORD WINAPI rt_thread_proc(LPVOID param) {
                 (now - g_last_log_time) > LOG_DEDUP_INTERVAL_SEC) {
               scan_core_scan_file(g_sigdb_path, utf8_path, reason);
               strncpy(g_last_log_path, utf8_path, MAX_PATH - 1);
+              g_last_log_path[MAX_PATH - 1] = '\0';
               g_last_log_time = now;
             }
           }
@@ -153,7 +178,7 @@ static DWORD WINAPI rt_startup_scan_proc(LPVOID param) {
   char utf8_root[MAX_PATH];
   wide_to_utf8(g_watch_root, utf8_root, MAX_PATH);
   printf("[RT-MONITOR] Starting background scan: %s\n", utf8_root);
-  scan_core_start_scan(g_sigdb_path, utf8_root, true);
+  scan_core_start_scan(g_sigdb_path, utf8_root, true, false);
   return 0;
 }
 
@@ -217,3 +242,4 @@ void rt_monitor_stop(void) {
     g_rt_thread = NULL;
   }
 }
+

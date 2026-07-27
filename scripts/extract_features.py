@@ -3,6 +3,7 @@ import os
 import mmh3
 import random
 import multiprocessing as mp
+import argparse
 from tqdm import tqdm
 
 try:
@@ -11,9 +12,6 @@ except ImportError:
     import json
     print("Warning: orjson not found. Using standard json (slower).")
 
-DB_PATH = "D:/train_data.db"
-TRAIN_TXT = "assets/data/train.txt"
-TEST_TXT = "assets/data/test.txt"
 FEATURE_COUNT = 2381
 
 def hash_feature(vec_dict, string_val, start_idx, num_dims):
@@ -135,10 +133,10 @@ def dict_to_libsvm(label, vec_dict):
     return " ".join(parts) + "\n"
 
 def process_chunk(args):
-    table_name, is_64bit, start_id, end_id, seed_offset = args
+    db_path, table_name, is_64bit, start_id, end_id, seed_offset = args
     
     # Independent sqlite connection per worker
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(db_path, timeout=30)
     conn.isolation_level = None
     cur = conn.cursor()
     cur.execute("PRAGMA read_uncommitted = True")
@@ -167,51 +165,67 @@ def process_chunk(args):
     return len(rows), train_lines, test_lines
 
 def main():
-    if not os.path.exists(DB_PATH):
-        print(f"Error: Database not found at {DB_PATH}")
+    parser = argparse.ArgumentParser(
+        description="Extract 2381-dim sparse LIBSVM features from the training SQLite database."
+    )
+    parser.add_argument("--db", required=True, help="Input SQLite database path.")
+    parser.add_argument("--train-out", default="assets/data/train.txt", help="Output train LIBSVM file.")
+    parser.add_argument("--test-out", default="assets/data/test.txt", help="Output test LIBSVM file.")
+    parser.add_argument("--win32-table", default="win32", help="SQLite table name for win32 rows.")
+    parser.add_argument("--win64-table", default="win64", help="SQLite table name for win64 rows.")
+    parser.add_argument("--chunk-size", type=int, default=10000, help="SQLite rowid chunk size.")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.db):
+        print(f"Error: Database not found at {args.db}")
         return
 
-    os.makedirs(os.path.dirname(TRAIN_TXT), exist_ok=True)
+    train_dir = os.path.dirname(args.train_out)
+    test_dir = os.path.dirname(args.test_out)
+    if train_dir:
+        os.makedirs(train_dir, exist_ok=True)
+    if test_dir:
+        os.makedirs(test_dir, exist_ok=True)
     
     print("=" * 60)
     print("  EMBER-2024 Fast Multiprocess ETL Pipeline")
     print("=" * 60)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(args.db)
     cur = conn.cursor()
     
     # Get max rowids natively
-    cur.execute("SELECT MAX(rowid) FROM win64")
+    cur.execute(f"SELECT MAX(rowid) FROM {args.win64_table}")
     max_win64 = cur.fetchone()[0] or 1040000
     
-    cur.execute("SELECT MAX(rowid) FROM win32")
+    cur.execute(f"SELECT MAX(rowid) FROM {args.win32_table}")
     max_win32 = cur.fetchone()[0] or 3120000
     conn.close()
     
-    chunk_size = 10000
+    chunk_size = args.chunk_size
     tasks = []
     seed_ctr = 0
     
     for start_id in range(0, max_win64, chunk_size):
-        tasks.append(("win64", True, start_id, start_id + chunk_size, seed_ctr))
+        tasks.append((args.db, args.win64_table, True, start_id, start_id + chunk_size, seed_ctr))
         seed_ctr += 1
         
     for start_id in range(0, max_win32, chunk_size):
-        tasks.append(("win32", False, start_id, start_id + chunk_size, seed_ctr))
+        tasks.append((args.db, args.win32_table, False, start_id, start_id + chunk_size, seed_ctr))
         seed_ctr += 1
         
     total_rows = max_win32 + max_win64
     
     # Clear out files first
-    open(TRAIN_TXT, 'w').close()
-    open(TEST_TXT, 'w').close()
+    open(args.train_out, 'w').close()
+    open(args.test_out, 'w').close()
     
     cpu_count = max(1, mp.cpu_count() - 2)
     print(f"[1] Launching {cpu_count} worker processes for {total_rows:,} rows...")
     
     # We open files in append mode. The main process writes chunks as they complete natively.
-    f_train = open(TRAIN_TXT, 'a')
-    f_test = open(TEST_TXT, 'a')
+    f_train = open(args.train_out, 'a')
+    f_test = open(args.test_out, 'a')
     
     with mp.Pool(processes=cpu_count) as pool:
         # imap_unordered is incredibly fast as it doesn't wait to sort the output array

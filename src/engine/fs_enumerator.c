@@ -18,21 +18,9 @@
  * ========================================================================== */
 
 /**
- * @brief Safely add a path to the dynamically growing FilePathList.
- */
-static void add_path(FilePathList *list, const char *p)
-{
-    char **new_paths = realloc(list->paths, sizeof(char *) * (list->count + 1));
-    if (new_paths != NULL) {
-        list->paths = new_paths;
-        list->paths[list->count++] = _strdup(p);
-    }
-}
-
-/**
  * @brief Recursive internal walker function.
  */
-static void walk_recursive(const char *dir, FilePathList *list)
+static void walk_recursive(const char *dir, fs_enum_callback_t callback, void *user_data)
 {
     char pattern[MAX_PATH];
     snprintf(pattern, MAX_PATH, "%s\\*", dir);
@@ -55,10 +43,10 @@ static void walk_recursive(const char *dir, FilePathList *list)
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
             /* Recursively enter directories */
-            walk_recursive(full_path, list);
+            walk_recursive(full_path, callback, user_data);
         } else {
-            /* Log standard files */
-            add_path(list, full_path);
+            /* Report standard files */
+            callback(full_path, user_data);
         }
     } while (FindNextFileA(h, &fd));
 
@@ -69,35 +57,14 @@ static void walk_recursive(const char *dir, FilePathList *list)
  * Public Functions
  * ========================================================================== */
 
-int list_files_recursive(const char *root, FilePathList *out)
+int list_files_recursive(const char *root, fs_enum_callback_t callback, void *user_data)
 {
-    if (root == NULL || out == NULL) {
+    if (root == NULL || callback == NULL) {
         return -1;
     }
 
-    /* Initialize list */
-    out->paths = NULL;
-    out->count = 0;
-
     /* Start recursive search */
-    walk_recursive(root, out);
+    walk_recursive(root, callback, user_data);
 
     return 0;
-}
-
-void free_filepath_list(FilePathList *list)
-{
-    if (list == NULL || list->paths == NULL) {
-        return;
-    }
-
-    for (int i = 0; i < list->count; i++) {
-        if (list->paths[i] != NULL) {
-            free(list->paths[i]);
-        }
-    }
-
-    free(list->paths);
-    list->paths = NULL;
-    list->count = 0;
 }

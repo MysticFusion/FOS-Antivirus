@@ -1,14 +1,20 @@
 import lightgbm as lgb
 import time
 import os
-
-TRAIN_TXT = "assets/data/train.txt"
-TEST_TXT = "assets/data/test.txt"
-MODEL_LGB_TXT = "assets/models/forest.txt"
+import argparse
 
 def main():
-    if not os.path.exists(TRAIN_TXT):
-        print(f"Error: {TRAIN_TXT} not found. Run extract_features.py first.")
+    parser = argparse.ArgumentParser(description="Train the FOS LightGBM malware model.")
+    parser.add_argument("--train", default="assets/data/train.txt", help="Input train LIBSVM file.")
+    parser.add_argument("--valid", default="assets/data/test.txt", help="Input validation LIBSVM file.")
+    parser.add_argument("--model-out", default="assets/models/forest.txt", help="Output LightGBM text model.")
+    args = parser.parse_args()
+
+    if not os.path.exists(args.train):
+        print(f"Error: {args.train} not found. Run extract_features.py first.")
+        return
+    if not os.path.exists(args.valid):
+        print(f"Error: {args.valid} not found. Run extract_features.py first.")
         return
 
     print("=" * 60)
@@ -22,8 +28,8 @@ def main():
     # loading it all at once. Cuts peak RAM by ~60% at the cost of 2-3x slower
     # bin-mapping. max_bin=63 halves the bin table size further.
     low_ram_params = {'two_round': True, 'max_bin': 63}
-    train_data = lgb.Dataset(TRAIN_TXT, params=low_ram_params)
-    test_data  = lgb.Dataset(TEST_TXT,  params=low_ram_params, reference=train_data)
+    train_data = lgb.Dataset(args.train, params=low_ram_params)
+    test_data  = lgb.Dataset(args.valid,  params=low_ram_params, reference=train_data)
 
     print(f"    Datasets configured in {time.time() - t0:.2f}s")
     
@@ -60,9 +66,11 @@ def main():
     print(f"    Training finished in {time.time() - t0:.2f}s")
     
     # [3] Export
-    os.makedirs(os.path.dirname(MODEL_LGB_TXT), exist_ok=True)
-    gbm.save_model(MODEL_LGB_TXT)
-    print(f"\n[3] Saved LightGBM tree dump to {MODEL_LGB_TXT}")
+    out_dir = os.path.dirname(args.model_out)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+    gbm.save_model(args.model_out)
+    print(f"\n[3] Saved LightGBM tree dump to {args.model_out}")
     print("    Ready for export_lgb_to_forest.py conversion.")
 
 if __name__ == '__main__':

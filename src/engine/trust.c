@@ -31,8 +31,18 @@ static bool path_starts_with_w(const WCHAR *path, const WCHAR *prefix) {
  * Digital Signature Verification
  * ========================================================================== */
 
+/**
+ * @brief Verify the digital signature of a file.
+ *
+ * @param path                File to verify.
+ * @param is_microsoft_signed Output: set to true if signed by Microsoft.
+ * @param quick_mode          If true, skip revocation checking (WTD_REVOCATION_CHECK_NONE).
+ *                            If false, use cache-only revocation (WTD_REVOKE_WHOLECHAIN
+ *                            + WTD_CACHE_ONLY_URL_RETRIEVAL).
+ */
 static bool verify_digital_signature(const char *path,
-                                     bool *is_microsoft_signed) {
+                                     bool *is_microsoft_signed,
+                                     bool quick_mode) {
   if (is_microsoft_signed)
     *is_microsoft_signed = false;
 
@@ -45,10 +55,21 @@ static bool verify_digital_signature(const char *path,
 
   WINTRUST_DATA trust_data = {sizeof(trust_data)};
   trust_data.dwUIChoice = WTD_UI_NONE;
-  trust_data.fdwRevocationChecks = WTD_REVOKE_NONE;
   trust_data.dwUnionChoice = WTD_CHOICE_FILE;
   trust_data.pFile = &file_info;
-  trust_data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+  if (quick_mode) {
+    /* v1.2: Quick mode — skip revocation entirely. This is much faster
+     * (no CRL/OCSP checks) at the cost of not detecting revoked certificates.
+     * Acceptable for quick scan where speed is the priority. */
+    trust_data.fdwRevocationChecks = WTD_REVOCATION_CHECK_NONE;
+    trust_data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+  } else {
+    /* Full mode — original behavior: whole-chain revocation with cache-only
+     * URL retrieval (no network fetch, but still checks cached CRL/OCSP). */
+    trust_data.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+    trust_data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
+  }
 
   GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
   LONG status = WinVerifyTrust(NULL, &policy, &trust_data);
@@ -74,7 +95,7 @@ static bool verify_digital_signature(const char *path,
  * Public Functions
  * ========================================================================== */
 
-TrustLevel trust_evaluate_path(const char *path) {
+TrustLevel trust_evaluate_path(const char *path, bool quick_mode) {
   if (path == NULL || *path == '\0')
     return TRUST_NONE;
 
@@ -84,30 +105,14 @@ TrustLevel trust_evaluate_path(const char *path) {
   PWSTR win_path = NULL, prog_path = NULL, prog86_path = NULL, data_path = NULL;
   TrustLevel result = TRUST_NONE;
 
-  // 1. Core System Locations (High Trust)
-  if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_Windows, 0, NULL, &win_path))) {
-    WCHAR sys32[MAX_PATH], winsxs[MAX_PATH];
-    StringCchCopyW(sys32, MAX_PATH, win_path);
-    StringCchCatW(sys32, MAX_PATH, L"\\System32\\");
-    StringCchCopyW(winsxs, MAX_PATH, win_path);
-    StringCchCatW(winsxs, MAX_PATH, L"\\WinSxS\\");
-
-    if (path_starts_with_w(w_path, sys32) ||
-        path_starts_with_w(w_path, winsxs)) {
-      result = TRUST_HIGH;
-    }
-    CoTaskMemFree(win_path);
-    if (result == TRUST_HIGH)
-      return result;
-  }
-
-  // 2. Digital Signature Verification
+  /* 1. Digital Signature Verification */
   bool is_microsoft = false;
-  if (verify_digital_signature(path, &is_microsoft)) {
+  if (verify_digital_signature(path, &is_microsoft, quick_mode)) {
     return is_microsoft ? TRUST_HIGH : TRUST_PARTIAL;
   }
 
-  // 3. Application Directories (Partial Trust)
+  /* 2. Application Directories (Partial Trust)
+   * Only reached if signature verification failed (unsigned or invalid). */
   if (SUCCEEDED(
           SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, NULL, &prog_path))) {
     if (path_starts_with_w(w_path, prog_path))
