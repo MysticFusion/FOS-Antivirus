@@ -8,6 +8,7 @@
 #include "signature_scan_sqlite.h"
 #include "hash_util.h"
 #include "db_hmac.h"
+#include "aggregator_hash.h" /* I-19: build-time SHA-256 pin of hash_aggregator.py */
 
 #include <errno.h>
 #include <stdarg.h>
@@ -98,6 +99,16 @@ static int hex_string_to_bytes(const char *hex,
     return 0;
 }
 
+static void hex_bytes_to_string(const unsigned char *bytes, size_t len,
+                                char out[SHA256_SIZE * 2 + 1]) {
+    static const char k_hex_digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i * 2] = k_hex_digits[bytes[i] >> 4];
+        out[i * 2 + 1] = k_hex_digits[bytes[i] & 0x0F];
+    }
+    out[len * 2] = '\0';
+}
+
 static bool is_valid_sha256_line(const char *line) {
     if (line == NULL) return false;
     for (int i = 0; i < SHA256_SIZE * 2; ++i) {
@@ -178,6 +189,10 @@ const char *update_error_code_to_message(int code) {
             return "Update failed: the signature database integrity file could not be "
                    "written (insufficient permissions?). The database location requires "
                    "administrator rights to update.";
+        case UPDATE_ERR_SCRIPT_TAMPERED:
+            return "Update failed: hash_aggregator.py failed its integrity check. The "
+                   "script next to the executable does not match the build-time hash; "
+                   "reinstall FOS Antivirus or update the build.";
         default:
             return "Update failed due to an unknown error.";
     }
@@ -693,13 +708,27 @@ int update_signature_db(const char *db_path) {
         return -1;
     }
 
-    /* 3. Build command line: python.exe "<script>" --db "<db_path>" update.
+    /* 3. I-19: verify the staged script against its build-time SHA-256 pin.
+     *    A planted or tampered script (path-planting, drive-by edit) fails
+     *    here and is never executed. */
+    unsigned char script_hash[SHA256_SIZE];
+    char script_hash_hex[SHA256_SIZE * 2 + 1];
+    hex_bytes_to_string(script_hash, SHA256_SIZE, script_hash_hex);
+    if (compute_file_sha256(script_path, script_hash) != 0 ||
+        _stricmp(script_hash_hex, AGGREGATOR_SHA256_HEX) != 0) {
+        update_error_code = UPDATE_ERR_SCRIPT_TAMPERED;
+        update_progress = -1;
+        ReleaseSRWLockExclusive(&g_update_lock);
+        return -1;
+    }
+
+    /* 4. Build command line: python.exe "<script>" --db "<db_path>" update.
      *    All paths are quoted in case of spaces (e.g. "C:\Program Files\..."). */
     snprintf(cmdline, sizeof(cmdline),
              "\"%s\" \"%s\" --db \"%s\" update",
              python_path, script_path, db_path);
 
-    /* 4. Set up stdout pipe so we can read JSONL progress */
+    /* 5. Set up stdout pipe so we can read JSONL progress */
     SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
     HANDLE hChildStdoutRead = NULL, hChildStdoutWrite = NULL;
     if (!CreatePipe(&hChildStdoutRead, &hChildStdoutWrite, &sa, 0)) {
@@ -711,7 +740,7 @@ int update_signature_db(const char *db_path) {
     /* Ensure the read handle is NOT inherited */
     SetHandleInformation(hChildStdoutRead, HANDLE_FLAG_INHERIT, 0);
 
-    /* 5. Launch the Python process */
+    /* 6. Launch the Python process */
     STARTUPINFOA si = {0};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
@@ -744,11 +773,11 @@ int update_signature_db(const char *db_path) {
         return -1;
     }
 
-    /* 6. Start the stdout reader thread (parses JSONL progress) */
+    /* 7. Start the stdout reader thread (parses JSONL progress) */
     HANDLE hReader = CreateThread(NULL, 0, stdout_reader_thread,
                                   hChildStdoutRead, 0, NULL);
 
-    /* 7. Wait for the Python process to finish (with timeout) */
+    /* 8. Wait for the Python process to finish (with timeout) */
     DWORD wait_result = WaitForSingleObject(pi.hProcess, UPDATE_TIMEOUT_MS);
     DWORD exit_code = 0;
     GetExitCodeProcess(pi.hProcess, &exit_code);

@@ -116,7 +116,8 @@ typedef enum {
     UPDATE_ERR_SCRIPT_NOT_FOUND,  /**< hash_aggregator.py not found               */
     UPDATE_ERR_PYTHON_FAILED,     /**< Python script exited non-zero              */
     UPDATE_ERR_PYTHON_TIMEOUT,    /**< Python script exceeded timeout             */
-    UPDATE_ERR_HMAC_WRITE         /**< DB integrity file could not be written     */
+    UPDATE_ERR_HMAC_WRITE,        /**< DB integrity file could not be written     */
+    UPDATE_ERR_SCRIPT_TAMPERED    /**< I-19: staged script hash != build-time pin */
 } UpdateErrorCode;
 
 int signature_db_validate_file(const char *sigdb_path);
