@@ -1,0 +1,71 @@
+cmake_minimum_required(VERSION 3.17)
+project(AntivirusFYP C)
+
+set(CMAKE_C_STANDARD 11)
+
+# 1. Find GTK4 (Frontend)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GTK4 REQUIRED gtk4)
+
+# 2. Include Directories
+# We include src/ as the root for simpler include paths
+include_directories(
+    src
+    src/app
+    src/engine
+    src/ui
+    ${GTK4_INCLUDE_DIRS}
+)
+
+link_directories(${GTK4_LIBRARY_DIRS})
+add_definitions(${GTK4_CFLAGS_OTHER})
+
+# 3. Add Executable
+add_executable(Antivirus 
+    src/main.c
+    src/app/app.c
+    # UI Files
+    src/ui/ui_scan_paths.c
+    src/ui/ui_sidebar.c
+    src/ui/ui_views.c
+    src/ui/ui_scan.c
+    src/ui/ui_history.c
+    src/ui/ui_update.c
+    # Engine Files
+    src/engine/scan_core.c
+    src/engine/hash_util.c
+    src/engine/fs_enumerator.c
+    src/engine/sha2.c
+    src/engine/signature_scan.c
+    src/engine/feature_extract.c
+    src/engine/heuristic_engine.c
+    src/engine/scan_report_bridge.c
+    src/engine/scan_executor.c
+    src/engine/response_engine.c
+    src/engine/rt_monitor.c
+    src/engine/trust.c
+    src/engine/scan_progress.c
+    src/engine/ml_engine.c
+)
+
+# 4. Link Libraries
+target_link_libraries(Antivirus 
+    ${GTK4_LIBRARIES}
+    ws2_32
+    urlmon
+    wintrust
+    crypt32
+    shlwapi
+    shell32
+    ole32
+    oleaut32
+)
+
+# 5. Post-Build: Copy Resources (Model & Database)
+add_custom_command(TARGET Antivirus POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/ml/models
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different 
+        ${CMAKE_SOURCE_DIR}/assets/models/forest.bin
+        ${CMAKE_BINARY_DIR}/ml/models/forest.bin
+    COMMENT "Copying ML Resources to Build Directory"
+)
