@@ -22,6 +22,10 @@ set(APP_SOURCES
     src/app/auto_update.c
 )
 
+set(UTIL_SOURCES
+    src/utils/path_utils.c
+)
+
 set(ENGINE_SOURCES
     src/engine/feature_extract.c
     src/engine/fs_enumerator.c
@@ -56,6 +60,7 @@ add_executable(FOS-Antivirus WIN32
     ${MAIN_SOURCE}
     ${APP_SOURCES}
     ${ENGINE_SOURCES}
+    ${UTIL_SOURCES}
     ${UI_SOURCES}
 )
 
@@ -65,6 +70,7 @@ target_include_directories(FOS-Antivirus PRIVATE
     ${CMAKE_SOURCE_DIR}/src/app
     ${CMAKE_SOURCE_DIR}/src/engine
     ${CMAKE_SOURCE_DIR}/src/ui
+    ${CMAKE_SOURCE_DIR}/src/utils
 )
 
 # --- NEW: Link GTK and SQLite to your executable ---
@@ -82,6 +88,8 @@ target_link_libraries(FOS-Antivirus PRIVATE
     advapi32
     wininet
     psapi
+    bcrypt
+    crypt32
 )
 # ----------------------------------------
 
