@@ -9,6 +9,8 @@
  * find_or_create_record, dispatch_and_cleanup, and the split
  * submit_signature/submit_heuristic API) was removed; the serial pipeline
  * submits fully-aggregated results via scan_report_submit_complete().
+ * I-12: per-file verdicts are written to the history log
+ * (log_scan_completed) instead of invisible WIN32-console printf.
  *
  */
 
@@ -55,6 +57,30 @@ static void log_heuristic_event(const char *path, const HeuristicResult *heur) {
   fprintf(f, "[%s] FILE=%s SCORE=%d VERDICT=%d REASON=%s\n", ts, path,
           heur->score, heur->verdict, heur->explanation);
 
+  fclose(f);
+}
+
+/**
+ * @brief Append a per-file scan result to the central history log
+ *        (I-12: structured logging replaces WIN32-console printf).
+ */
+static void log_scan_completed(const char *path, bool threat_found,
+                               double ml_score) {
+  FILE *f = fopen(app_path_history_log(), "a");
+  if (f == NULL) {
+    return;
+  }
+
+  time_t now = time(NULL);
+  char ts[64];
+  strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+  fprintf(f, "[%s] SCAN=%s | VERDICT=%s", ts, path,
+          threat_found ? "THREAT_DETECTED" : "CLEAN");
+  if (ml_score >= 0.0) {
+    fprintf(f, " | ML=%.4f", ml_score);
+  }
+  fprintf(f, "\n");
   fclose(f);
 }
 
@@ -116,17 +142,7 @@ void scan_report_submit_complete(ScanInput *input, const SignatureResult *sig,
     response_quarantine_file(input->path, label);
   }
 
-  if (threat_found) {
-    printf("[SCAN-COMPLETED] File: %s | Verdict: THREAT DETECTED", input->path);
-  } else {
-    printf("[SCAN-COMPLETED] File: %s | Verdict: CLEAN", input->path);
-  }
-
-  if (ml_score >= 0.0) {
-    printf(" (ML Score: %.4f)\n", ml_score);
-  } else {
-    printf("\n");
-  }
+  log_scan_completed(input->path, threat_found, ml_score);
 
   scan_progress_file_done(threat_found);
 

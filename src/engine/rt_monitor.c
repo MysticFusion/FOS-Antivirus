@@ -119,7 +119,9 @@ static DWORD WINAPI rt_rescan_proc(LPVOID param) {
   watch_handle_t *w = (watch_handle_t *)param;
   char utf8_root[FOS_MAX_PATH * 4];
   if (wide_to_utf8(w->root_path, utf8_root, sizeof(utf8_root))) {
-    printf("[RT-MONITOR] Full rescan: %s\n", utf8_root);
+    char logbuf[FOS_MAX_PATH * 4 + 64];
+    snprintf(logbuf, sizeof(logbuf), "Full rescan: %s", utf8_root);
+    rt_log_event(logbuf);
     scan_core_start_scan(g_sigdb_path, utf8_root, true, false);
   }
   InterlockedExchange(&w->rescan_pending, 0);
@@ -208,11 +210,7 @@ static void process_events(watch_handle_t *w, DWORD bytes) {
         LeaveCriticalSection(&g_rt_lock);
         if (rw_signals_confirmed(signals)) {
           reason = SCAN_REASON_RANSOMWARE_BURST;
-          printf("[RT-MONITOR] !!! RANSOMWARE BURST DETECTED (%s, %s): %s !!!\n",
-                 (signals & RW_SIG_RATE) ? "rate" : "-",
-                 (signals & RW_SIG_EXT) ? "ext-rewrite" : "-",
-                 utf8_path);
-          char logbuf[256];
+          char logbuf[FOS_MAX_PATH * 4 + 64];
           snprintf(logbuf, sizeof(logbuf),
                    "ransomware context (rate=%d ext=%d scope=%d): %s",
                    (signals & RW_SIG_RATE) ? 1 : 0,
@@ -269,7 +267,9 @@ static DWORD WINAPI rt_startup_scan_proc(LPVOID param) {
   char utf8_root[FOS_MAX_PATH * 4];
   if (g_num_watches > 0) {
     wide_to_utf8(g_watches[0].root_path, utf8_root, sizeof(utf8_root));
-    printf("[RT-MONITOR] Starting background scan: %s\n", utf8_root);
+    char logbuf[FOS_MAX_PATH * 4 + 64];
+    snprintf(logbuf, sizeof(logbuf), "Starting background scan: %s", utf8_root);
+    rt_log_event(logbuf);
     scan_core_start_scan(g_sigdb_path, utf8_root, true, false);
   }
   return 0;
@@ -318,7 +318,12 @@ int rt_monitor_start(const char *sigdb_path) {
     }
     InterlockedExchange(&w->active, 1);
     g_num_watches++;
-    printf("[RT-MONITOR] Watching: %ls\n", w->root_path);
+    char utf8_watch[FOS_MAX_PATH * 4];
+    if (wide_to_utf8(w->root_path, utf8_watch, sizeof(utf8_watch))) {
+      char logbuf[FOS_MAX_PATH * 4 + 64];
+      snprintf(logbuf, sizeof(logbuf), "Watching: %s", utf8_watch);
+      rt_log_event(logbuf);
+    }
   }
 
   if (g_num_watches == 0) {
