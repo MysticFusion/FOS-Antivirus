@@ -36,6 +36,7 @@ set(ENGINE_SOURCES
     src/engine/ml_engine.c
     src/engine/response_engine.c
     src/engine/rt_monitor.c
+    src/engine/ransomware_signals.c
     src/engine/scan_core.c
     src/engine/scan_executor.c
     src/engine/scan_persistence.c
@@ -183,6 +184,15 @@ if(BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/tests/unity
     )
     add_test(NAME unit_test_path_utils COMMAND unit_test_path_utils)
+
+    # R-05 content-aware ransomware signal tracker (I-09)
+    add_executable(unit_test_ransomware_signals
+        tests/unit/test_ransomware_signals.c
+        ${UNITY_SOURCES}
+        src/engine/ransomware_signals.c
+    )
+    target_include_directories(unit_test_ransomware_signals PRIVATE ${TEST_INCLUDE_DIRS})
+    add_test(NAME unit_test_ransomware_signals COMMAND unit_test_ransomware_signals)
 
     # Ed25519 model-signature verification (known-answer + end-to-end)
     add_executable(security_test_model_signature

@@ -35,7 +35,7 @@ int db_hmac_compute_file(const char *db_path, uint8_t out[DB_HMAC_SIZE])
 
     sha256_ctx ctx;
     sha256_init(&ctx);
-    uint8_t inner[64];
+    uint8_t inner[DB_HMAC_SIZE];
     /* First update: HMAC inner hash = H(ipad_key || message). */
     uint8_t ipad_key[HMAC_BLOCK_SIZE] = {0};
     uint8_t opad_key[HMAC_BLOCK_SIZE] = {0};

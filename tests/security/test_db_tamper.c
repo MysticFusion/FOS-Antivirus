@@ -91,6 +91,16 @@ static void test_empty_db_still_verified(void) {
   TEST_ASSERT_EQUAL_INT(-1, db_hmac_verify_file("\\\\nonexistent\\\\db.bin"));
 }
 
+/* Regression: compute must be deterministic (no uninitialized stack input).
+ * The old code hashed 64 bytes of `inner` of which only 32 were filled. */
+static void test_hmac_computation_is_deterministic(void) {
+  write_db("determinism-check-0123456789abcdef0123456789abcdef\n");
+  uint8_t a[DB_HMAC_SIZE], b[DB_HMAC_SIZE];
+  TEST_ASSERT_EQUAL_INT(0, db_hmac_compute_file(g_db, a));
+  TEST_ASSERT_EQUAL_INT(0, db_hmac_compute_file(g_db, b));
+  TEST_ASSERT_EQUAL_INT(0, memcmp(a, b, DB_HMAC_SIZE));
+}
+
 void setUp(void) {}
 void tearDown(void) {
   remove_hmac();
@@ -109,5 +119,6 @@ int main(void) {
   RUN_TEST(test_truncated_hmac_fails);
   RUN_TEST(test_hmac_file_extra_bytes_fails);
   RUN_TEST(test_empty_db_still_verified);
+  RUN_TEST(test_hmac_computation_is_deterministic);
   return UNITY_END();
 }

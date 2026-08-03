@@ -94,6 +94,14 @@ void evaluate_heuristics(
     if (reason == SCAN_REASON_RANSOMWARE_BURST) {
         score += 80;
         append_reason(reasons, sizeof(reasons), "Rapid-file-burst;");
+        /* R-05 entropy-spike corroboration: the burst context is
+         * confirmed by the monitor only when >=2 of (rate, extension
+         * rewriting, document-directory scope) agree; a high-entropy
+         * payload on top of that pushes the file over the line. */
+        if (f->high_entropy) {
+            score += 20;
+            append_reason(reasons, sizeof(reasons), "Burst-high-entropy;");
+        }
     }
 
     /* ========================================================================

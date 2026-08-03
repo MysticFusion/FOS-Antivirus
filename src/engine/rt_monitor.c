@@ -10,6 +10,7 @@
 #include "scan_core.h"
 #include "signature_scan.h"
 #include "path_utils.h"
+#include "ransomware_signals.h"
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <stdbool.h>
@@ -22,8 +23,7 @@
 #define RT_BUFFER_SIZE 65536
 #define MAX_WATCHES 8
 #define RT_WORKER_COUNT 4
-#define BURST_WINDOW_SEC 2
-#define BURST_THRESHOLD 5
+#define MAX_DOC_DIRS 3
 #define LOG_DEDUP_INTERVAL_SEC 1
 #define RESCAN_THROTTLE_SEC 10
 
@@ -51,10 +51,13 @@ static INIT_ONCE g_rt_once = INIT_ONCE_STATIC_INIT;
 static BOOL CALLBACK init_rt_lock(PINIT_ONCE o, PVOID p, PVOID *c){ (void)o;(void)p;(void)c; InitializeCriticalSection(&g_rt_lock); return TRUE; }
 static void ensure_lock(){ InitOnceExecuteOnce(&g_rt_once, init_rt_lock, NULL, NULL); }
 
-static time_t g_burst_timestamps[BURST_THRESHOLD] = {0};
-static int g_burst_head = 0;
 static char g_last_log_path[FOS_MAX_PATH * 4] = {0};
 static time_t g_last_log_time = 0;
+
+/* R-05: corroborated ransomware context (MAP R-05). */
+static rw_tracker_t *g_rw_tracker = NULL;
+static wchar_t g_doc_dirs[MAX_DOC_DIRS][FOS_MAX_PATH];
+static int g_num_doc_dirs = 0;
 
 static void rt_log_event(const char *message) {
   if (!message) return;
@@ -82,6 +85,33 @@ static bool is_interesting_file(const wchar_t *path) {
 static bool wide_to_utf8(const wchar_t *w, char *out, size_t out_sz) {
   if (!w || !out || out_sz==0) return false;
   return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)out_sz, NULL, NULL) > 0;
+}
+
+/* True if path is inside one of the user document directories. */
+static bool is_in_doc_dir(const wchar_t *path) {
+  if (!path) return false;
+  for (int i = 0; i < g_num_doc_dirs; i++) {
+    size_t n = wcslen(g_doc_dirs[i]);
+    if (n == 0) continue;
+    if (_wcsnicmp(path, g_doc_dirs[i], n) == 0) {
+      if (path[n] == L'\0' || path[n] == L'\\') return true;
+    }
+  }
+  return false;
+}
+
+static void resolve_doc_dirs(void) {
+  static const KNOWNFOLDERID *k_docs[] = {
+      &FOLDERID_Documents, &FOLDERID_Desktop, &FOLDERID_Pictures,
+  };
+  g_num_doc_dirs = 0;
+  for (size_t i = 0; i < sizeof(k_docs)/sizeof(k_docs[0]) && g_num_doc_dirs < MAX_DOC_DIRS; i++) {
+    PWSTR p = NULL;
+    if (FAILED(SHGetKnownFolderPath(k_docs[i], 0, NULL, &p))) continue;
+    wcsncpy_s(g_doc_dirs[g_num_doc_dirs], FOS_MAX_PATH, p, _TRUNCATE);
+    CoTaskMemFree(p);
+    if (g_doc_dirs[g_num_doc_dirs][0] != L'\0') g_num_doc_dirs++;
+  }
 }
 
 /* Full rescan of one watched root (buffer overflow / watch I/O failure). */
@@ -134,6 +164,25 @@ static void process_events(watch_handle_t *w, DWORD bytes) {
     rel_path[char_count] = L'\0';
     if (PathCombineW(full_path, w->root_path, rel_path) == NULL) goto next_entry;
 
+    time_t now = time(NULL);
+
+    /* R-05: feed the corroboration tracker with every file event
+     * (extension rewriting pairs by FILE_ID, rate counts any create/
+     * modify). */
+    ensure_lock();
+    EnterCriticalSection(&g_rt_lock);
+    if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_MODIFIED) {
+      rw_tracker_on_exec_event(g_rw_tracker, now);
+    } else if (fni->Action == FILE_ACTION_RENAMED_OLD_NAME) {
+      rw_tracker_on_rename_old(g_rw_tracker, now, (uint64_t)fni->FileId.QuadPart,
+                               PathFindExtensionW(full_path));
+    } else if (fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
+      rw_tracker_on_exec_event(g_rw_tracker, now);
+      rw_tracker_on_rename_new(g_rw_tracker, now, (uint64_t)fni->FileId.QuadPart,
+                               PathFindExtensionW(full_path));
+    }
+    LeaveCriticalSection(&g_rt_lock);
+
     if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_MODIFIED ||
         fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
       if (is_interesting_file(full_path)) {
@@ -146,21 +195,31 @@ static void process_events(watch_handle_t *w, DWORD bytes) {
             if (attrs.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) goto next_entry;
           }
         }
-        ScanReason reason = SCAN_REASON_RT_MODIFY;
-        time_t now = time(NULL);
-        if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
-          ensure_lock();
-          EnterCriticalSection(&g_rt_lock);
-          g_burst_timestamps[g_burst_head] = now;
-          g_burst_head = (g_burst_head + 1) % BURST_THRESHOLD;
-          time_t oldest = g_burst_timestamps[g_burst_head];
-          LeaveCriticalSection(&g_rt_lock);
-          if (oldest > 0 && (now - oldest) <= BURST_WINDOW_SEC) {
-            reason = SCAN_REASON_RANSOMWARE_BURST;
-            printf("[RT-MONITOR] !!! RANSOMWARE BURST DETECTED: %s !!!\n", utf8_path);
-          } else {
-            reason = SCAN_REASON_RT_CREATE;
-          }
+        ScanReason reason = (fni->Action == FILE_ACTION_ADDED ||
+                             fni->Action == FILE_ACTION_RENAMED_NEW_NAME)
+                                ? SCAN_REASON_RT_CREATE
+                                : SCAN_REASON_RT_MODIFY;
+
+        /* R-05: ransomware context only with >=2 corroborating signals
+         * (rate / extension-rewriting / document-directory scope). */
+        ensure_lock();
+        EnterCriticalSection(&g_rt_lock);
+        int signals = rw_tracker_signals(g_rw_tracker, now, is_in_doc_dir(full_path));
+        LeaveCriticalSection(&g_rt_lock);
+        if (rw_signals_confirmed(signals)) {
+          reason = SCAN_REASON_RANSOMWARE_BURST;
+          printf("[RT-MONITOR] !!! RANSOMWARE BURST DETECTED (%s, %s): %s !!!\n",
+                 (signals & RW_SIG_RATE) ? "rate" : "-",
+                 (signals & RW_SIG_EXT) ? "ext-rewrite" : "-",
+                 utf8_path);
+          char logbuf[256];
+          snprintf(logbuf, sizeof(logbuf),
+                   "ransomware context (rate=%d ext=%d scope=%d): %s",
+                   (signals & RW_SIG_RATE) ? 1 : 0,
+                   (signals & RW_SIG_EXT) ? 1 : 0,
+                   (signals & RW_SIG_SCOPE) ? 1 : 0,
+                   utf8_path);
+          rt_log_event(logbuf);
         }
         ensure_lock();
         EnterCriticalSection(&g_rt_lock);
@@ -221,6 +280,9 @@ int rt_monitor_start(const char *sigdb_path) {
   if (InterlockedCompareExchange(&g_rt_running, 0, 0)) return 0;
   if (!sigdb_path) return -1;
   StringCchCopyA(g_sigdb_path, MAX_PATH, sigdb_path);
+
+  if (!g_rw_tracker) g_rw_tracker = rw_tracker_create();
+  resolve_doc_dirs();
 
   static const KNOWNFOLDERID *k_watch_folders[] = {
       &FOLDERID_Profile, &FOLDERID_Windows, &FOLDERID_ProgramFiles,
@@ -308,4 +370,8 @@ void rt_monitor_stop(void) {
     CloseHandle(g_iocp);
     g_iocp = NULL;
   }
+
+  rw_tracker_free(g_rw_tracker);
+  g_rw_tracker = NULL;
+  g_num_doc_dirs = 0;
 }
