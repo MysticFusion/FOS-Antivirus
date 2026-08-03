@@ -101,8 +101,10 @@ static uint32_t MurmurHash3_x86_32(const void *key, int len, uint32_t seed) {
   switch (len & 3) {
   case 3:
     k1 ^= tail[2] << 16;
+    /* fall through */
   case 2:
     k1 ^= tail[1] << 8;
+    /* fall through */
   case 1:
     k1 ^= tail[0];
     k1 *= c1;
@@ -126,7 +128,11 @@ static void hash_feature_str(float *vec, const char *str, int start_idx,
   if (!str)
     return;
   int32_t h = (int32_t)MurmurHash3_x86_32(str, (int)strlen(str), 0);
-  int idx = abs(h) % num_dims;
+  /* Mirror Python's abs(mmh3.hash(...)): INT32_MIN has no positive int32
+   * counterpart, so compute the magnitude in 64-bit to match Python exactly
+   * and avoid signed overflow (which would otherwise index out of bounds). */
+  uint64_t mag = (h < 0) ? (uint64_t)(-(int64_t)h) : (uint64_t)h;
+  int idx = (int)(mag % (uint64_t)num_dims);
   float val = (h > 0) ? 1.0f : -1.0f;
   vec[start_idx + idx] += val;
 }
@@ -153,61 +159,72 @@ static void calc_histograms(const uint8_t *data, size_t size, float *vec) {
     vec[FEAT_IDX_BYTE_HISTOGRAM_BASE + i] = (float)counts[i] / (float)size;
   }
 
-  /* 2. 2D Byte Entropy Histogram [FEAT_IDX_BYTE_ENTROPY_BASE .. +255]
-   * Sliding window entropy (using EMBER's 2048-byte window concept simplified) */
+  /* 2. EMBER 2D Byte-Entropy Histogram [FEAT_IDX_BYTE_ENTROPY_BASE .. +255]
+   *
+   * Exact port of EMBER's ByteEntropyHistogram (Saxe & Berlin 2015 style,
+   * https://github.com/elastic/ember). For every 2048-byte block (1024-byte
+   * stride) the block entropy is computed from a coarse 16-bin histogram of
+   * byte nibbles (byte >> 4); the entropy is doubled because 4-bit binning
+   * halves the information, then quantized to 16 entropy bins via
+   * Hbin = int(H * 2) with Hbin == 16 clamped to 15. The 16x16
+   * (entropy-bin, nibble) counts are flattened row-major to 256 dimensions
+   * and L1-normalized, exactly matching the EMBER JSONL "byteentropy" raw
+   * feature that extract_features.py reads. Note that even for files smaller
+   * than the window the probability denominator is the window size, as in
+   * the reference implementation. */
   const size_t window_size = 2048;
   const size_t step = 1024;
-  float ext_counts[256] = {0};
-  float total_ent_counts = 0.0f;
+  double ext_counts[16][16] = {{0}};
+  double total_ext = 0.0;
 
   if (size < window_size) {
-    /* Just map raw entropy to byte buckets roughly if file is tiny to avoid
-     * div-by-zero */
-    double ent = 0;
-    for (int i = 0; i < 256; i++) {
-      if (counts[i]) {
-        double p = (double)counts[i] / size;
-        ent -= p * log2(p);
+    int64_t c[16] = {0};
+    for (size_t i = 0; i < size; i++)
+      c[data[i] >> 4]++;
+    double H = 0;
+    for (int n = 0; n < 16; n++) {
+      if (c[n] > 0) {
+        double p = (double)c[n] / (double)window_size;
+        H -= p * log2(p);
       }
     }
-    for (int i = 0; i < 256; i++) {
-      vec[FEAT_IDX_BYTE_ENTROPY_BASE + i] =
-          (counts[i] > 0) ? (float)(ent / size) : 0.0f;
+    H *= 2.0;
+    int Hbin = (int)(H * 2.0);
+    if (Hbin == 16)
+      Hbin = 15;
+    for (int n = 0; n < 16; n++) {
+      ext_counts[Hbin][n] = (double)c[n];
+      total_ext += (double)c[n];
     }
-    return;
+  } else {
+    for (size_t i = 0; i + window_size <= size; i += step) {
+      int64_t c[16] = {0};
+      for (size_t j = 0; j < window_size; j++)
+        c[data[i + j] >> 4]++;
+      double H = 0;
+      for (int n = 0; n < 16; n++) {
+        if (c[n] > 0) {
+          double p = (double)c[n] / (double)window_size;
+          H -= p * log2(p);
+        }
+      }
+      H *= 2.0;
+      int Hbin = (int)(H * 2.0);
+      if (Hbin == 16)
+        Hbin = 15;
+      for (int n = 0; n < 16; n++) {
+        ext_counts[Hbin][n] += (double)c[n];
+        total_ext += (double)c[n];
+      }
+    }
   }
 
-  size_t i = 0;
-  while (i + window_size <= size) {
-    uint32_t w_counts[256] = {0};
-    for (size_t j = 0; j < window_size; j++) {
-      w_counts[data[i + j]]++;
-    }
-    double ent = 0.0;
-    for (int c = 0; c < 256; c++) {
-      if (w_counts[c] > 0) {
-        double p = (double)w_counts[c] / window_size;
-        ent -= p * log2(p);
+  if (total_ext > 0) {
+    for (int hb = 0; hb < 16; hb++) {
+      for (int n = 0; n < 16; n++) {
+        vec[FEAT_IDX_BYTE_ENTROPY_BASE + hb * 16 + n] =
+            (float)(ext_counts[hb][n] / total_ext);
       }
-    }
-    /* EMBER quantizes entropy (0-8) into 16 bins usually, but conceptually
-     * it creates a 2D joint (byte, entropy) space flattened to 256.
-     * For precise compatibility without an enormous 2D sliding window state
-     * machine, we accumulate (entropy / window) * byte_occurrence perfectly
-     * safely. */
-    for (int c = 0; c < 256; c++) {
-      if (w_counts[c] > 0) {
-        ext_counts[c] += (float)(w_counts[c] * ent);
-        total_ent_counts += (float)(w_counts[c] * ent);
-      }
-    }
-    i += step;
-  }
-
-  /* L1 Normalize entropy histogram */
-  if (total_ent_counts > 0) {
-    for (int c = 0; c < 256; c++) {
-      vec[FEAT_IDX_BYTE_ENTROPY_BASE + c] = ext_counts[c] / total_ent_counts;
     }
   }
 }
@@ -617,5 +634,15 @@ int extract_file_features(const char *path, FileFeatures *out) {
 
   return 0;
 }
+
+/* Test-support hook (not part of the public API): exported only when the
+ * feature-parity harness (tests/python/) compiles with
+ * -DFOS_FEATURE_TEST_EXPORTS so it can compare the real hash against
+ * Python's mmh3.hash(seed=0). */
+#ifdef FOS_FEATURE_TEST_EXPORTS
+int32_t fos_test_murmur3(const char *s) {
+  return (int32_t)MurmurHash3_x86_32(s, (int)strlen(s), 0);
+}
+#endif
 
 
