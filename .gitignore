@@ -118,5 +118,12 @@ scripts/validate_output.txt
 # Specific Files
 FYP-2_Report.pdf
 
+# Local work docs & artifacts (never commit -- repo is public)
+MAP_work_stats.md
+Master_Action_Plan(MAP).md
+project_structure_&_code.txt
+export_project.py
+FOS-Antivirus-Hardened-Patch.zip
+
 # Agent rules (local only)
 .agents/
