@@ -26,10 +26,13 @@ def ingest_directory_to_sqlite(directory_path, db_path, table_name, batch_size=1
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     
-    # Aggressive Performance Tweaks
-    cursor.execute('PRAGMA synchronous = OFF')
-    cursor.execute('PRAGMA journal_mode = OFF') 
-    cursor.execute('PRAGMA cache_size = 100000') 
+    # I-21: durability-safe performance tweaks. WAL + synchronous=NORMAL
+    # keeps bulk-import speed while protecting against corruption on a
+    # crash mid-import (synchronous=OFF / journal_mode=OFF previously made
+    # a power loss or crash leave a torn, unrecoverable database).
+    cursor.execute('PRAGMA journal_mode = WAL')
+    cursor.execute('PRAGMA synchronous = NORMAL')
+    cursor.execute('PRAGMA cache_size = 100000')
     cursor.execute('PRAGMA temp_store = MEMORY')
     
     # Track known columns across all files
