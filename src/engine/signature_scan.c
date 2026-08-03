@@ -8,7 +8,7 @@
 #include "signature_scan_sqlite.h"
 #include "hash_util.h"
 #include "db_hmac.h"
-#include "aggregator_hash.h" /* I-19: build-time SHA-256 pin of hash_aggregator.py */
+#include "script_verify.h"   /* I-19: SHA-256 pin check for hash_aggregator.py */
 
 #include <errno.h>
 #include <stdarg.h>
@@ -97,16 +97,6 @@ static int hex_string_to_bytes(const char *hex,
         out[i] = (unsigned char)((hi << 4) | lo);
     }
     return 0;
-}
-
-static void hex_bytes_to_string(const unsigned char *bytes, size_t len,
-                                char out[SHA256_SIZE * 2 + 1]) {
-    static const char k_hex_digits[] = "0123456789abcdef";
-    for (size_t i = 0; i < len; i++) {
-        out[i * 2] = k_hex_digits[bytes[i] >> 4];
-        out[i * 2 + 1] = k_hex_digits[bytes[i] & 0x0F];
-    }
-    out[len * 2] = '\0';
 }
 
 static bool is_valid_sha256_line(const char *line) {
@@ -711,11 +701,7 @@ int update_signature_db(const char *db_path) {
     /* 3. I-19: verify the staged script against its build-time SHA-256 pin.
      *    A planted or tampered script (path-planting, drive-by edit) fails
      *    here and is never executed. */
-    unsigned char script_hash[SHA256_SIZE];
-    char script_hash_hex[SHA256_SIZE * 2 + 1];
-    hex_bytes_to_string(script_hash, SHA256_SIZE, script_hash_hex);
-    if (compute_file_sha256(script_path, script_hash) != 0 ||
-        _stricmp(script_hash_hex, AGGREGATOR_SHA256_HEX) != 0) {
+    if (signature_script_verify(script_path) != 0) {
         update_error_code = UPDATE_ERR_SCRIPT_TAMPERED;
         update_progress = -1;
         ReleaseSRWLockExclusive(&g_update_lock);

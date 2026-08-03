@@ -44,6 +44,7 @@ set(ENGINE_SOURCES
     src/engine/scan_progress.c
     src/engine/scan_report_bridge.c
     src/engine/sha2.c
+    src/engine/script_verify.c
     src/engine/signature_scan.c
     src/engine/signature_scan_sqlite.c
     src/engine/trust.c
@@ -267,6 +268,7 @@ if(BUILD_TESTING)
         tests/security/test_script_pin.c
         ${UNITY_SOURCES}
         src/engine/hash_util.c
+        src/engine/script_verify.c
         src/engine/sha2.c
         src/utils/path_utils.c
     )

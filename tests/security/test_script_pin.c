@@ -8,32 +8,27 @@
  *
  * Also proves the tamper path: a modified copy of the script must NOT match
  * the pin.
+ *
+ * The checks call the PRODUCTION function signature_script_verify() -- the
+ * exact gate used by update_signature_db() at runtime -- so the test cannot
+ * drift from the shipped code (it previously re-implemented the check and
+ * missed a call-order bug that made the runtime check fail unconditionally).
  */
 #include "unity.h"
 
 #include <stdio.h>
-#include <string.h>
+#include <windows.h>
 
-#include "aggregator_hash.h"
-#include "hash_util.h"
+#include "script_verify.h"
 
 static char g_staged_path[MAX_PATH];
 
 static void test_staged_script_matches_pin(void) {
-  unsigned char hash[SHA256_SIZE];
-  char hex[SHA256_SIZE * 2 + 1];
-  TEST_ASSERT_EQUAL_INT(0, compute_file_sha256(g_staged_path, hash));
-  for (int i = 0; i < SHA256_SIZE; i++) {
-    static const char *k_hex = "0123456789abcdef";
-    hex[i * 2] = k_hex[hash[i] >> 4];
-    hex[i * 2 + 1] = k_hex[hash[i] & 0x0F];
-  }
-  hex[SHA256_SIZE * 2] = '\0';
-  TEST_ASSERT_EQUAL_STRING(AGGREGATOR_SHA256_HEX, hex);
+  TEST_ASSERT_EQUAL_INT(0, signature_script_verify(g_staged_path));
 }
 
 static void test_tampered_script_does_not_match_pin(void) {
-  /* Append a byte and expect a different hash than the pin. */
+  /* Append a byte and expect the verify gate to reject it. */
   char tmp[MAX_PATH];
   snprintf(tmp, sizeof(tmp), "%s_tampered.py", g_staged_path);
   FILE *f = fopen(g_staged_path, "rb");
@@ -47,18 +42,8 @@ static void test_tampered_script_does_not_match_pin(void) {
   fclose(f);
   fclose(g);
 
-  unsigned char hash[SHA256_SIZE];
-  TEST_ASSERT_EQUAL_INT(0, compute_file_sha256(tmp, hash));
+  TEST_ASSERT_NOT_EQUAL(0, signature_script_verify(tmp));
   remove(tmp);
-  /* The pin is hex text; hash is raw bytes -- compare via recomputed hex. */
-  char hex[SHA256_SIZE * 2 + 1];
-  for (int i = 0; i < SHA256_SIZE; i++) {
-    static const char *k_hex = "0123456789abcdef";
-    hex[i * 2] = k_hex[hash[i] >> 4];
-    hex[i * 2 + 1] = k_hex[hash[i] & 0x0F];
-  }
-  hex[SHA256_SIZE * 2] = '\0';
-  TEST_ASSERT_NOT_EQUAL_STRING(AGGREGATOR_SHA256_HEX, hex);
 }
 
 void setUp(void) {}
