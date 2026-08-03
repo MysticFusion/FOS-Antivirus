@@ -112,6 +112,8 @@ build.ninja
 # Script output / log files
 scripts/etl_out.txt
 scripts/train_out.txt
+# Ed25519 model-signing private key (NEVER commit; public key is embedded in ml_engine.c)
+scripts/secrets/
 scripts/validate_output.txt
 # Specific Files
 FYP-2_Report.pdf

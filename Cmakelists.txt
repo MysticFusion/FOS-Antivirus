@@ -27,6 +27,7 @@ set(UTIL_SOURCES
 )
 
 set(ENGINE_SOURCES
+    src/engine/ed25519_verify.c
     src/engine/feature_extract.c
     src/engine/fs_enumerator.c
     src/engine/hash_util.c
@@ -110,7 +111,10 @@ add_custom_command(TARGET FOS-Antivirus POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/assets/models/forest.bin"
             "$<TARGET_FILE_DIR:FOS-Antivirus>/ml/models/forest.bin"
-    COMMENT "Staging ML model assets"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/assets/models/forest.bin.sig"
+            "$<TARGET_FILE_DIR:FOS-Antivirus>/ml/models/forest.bin.sig"
+    COMMENT "Staging ML model assets (forest.bin + Ed25519 signature)"
 )
 
 # Optional: Add standard compiler flags for warnings

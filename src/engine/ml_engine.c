@@ -2,6 +2,7 @@
  * @file ml_engine.c - Hardened ML engine
  */
 #include "ml_engine.h"
+#include "ed25519_verify.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +15,15 @@
 #define MAX_NODES_PER_TREE 1000000
 #define EXPECTED_FEATURES 2381
 #define MAX_FILE_SIZE (200 * 1024 * 1024) // 200MB max model
+
+/* Public half of the build-time Ed25519 keypair (scripts/sign_model.py).
+ * Regenerate with: python scripts/sign_model.py --model assets/models/forest.bin
+ * The private key is NOT part of the repository. */
+static const uint8_t k_ed25519_pubkey[32] = {
+    0x3f, 0x42, 0x14, 0x35, 0x0f, 0xcb, 0x57, 0x1d, 0x0d, 0x32, 0x01, 0xfc,
+    0xeb, 0x1d, 0x8c, 0x53, 0x51, 0xee, 0xcb, 0x14, 0x4f, 0x29, 0x24, 0xa2,
+    0x94, 0xee, 0x5e, 0x56, 0x0e, 0x5c, 0x8c, 0x0a,
+};
 
 #pragma pack(push, 1)
 typedef struct { int16_t feature_index; float threshold; int32_t left_child; int32_t right_child; float value; } ForestNode;
@@ -57,6 +67,29 @@ void ml_engine_pre_init(void)
     if (!g_init_event) g_init_event = CreateEvent(NULL, TRUE, FALSE, NULL);
 }
 
+static void ml_log_security_event(const char *msg)
+{
+    OutputDebugStringA(msg);
+    fprintf(stderr, "%s\n", msg);
+}
+
+static int read_sig_file(const char *model_path, uint8_t sig[64])
+{
+    size_t plen = strlen(model_path);
+    if (plen + 5 > MAX_PATH) return -1;
+    char sig_path[MAX_PATH] = {0};
+    memcpy(sig_path, model_path, plen);
+    memcpy(sig_path + plen, ".sig", 5);
+
+    FILE *f = NULL;
+    if (fopen_s(&f, sig_path, "rb") != 0 || !f) return -1;
+    size_t got = fread(sig, 1, 64, f);
+    int extra = (int)(fgetc(f) != EOF);
+    fclose(f);
+    if (got != 64 || extra != 0) return -1;
+    return 0;
+}
+
 int ml_engine_init(const char *model_path)
 {
     InitOnceExecuteOnce(&g_lock_once, init_lock_cb, NULL, NULL);
@@ -82,48 +115,80 @@ int ml_engine_init(const char *model_path)
         if (fopen_s(&f, bin_path, "rb") != 0) f = NULL;
         if (f) path = bin_path;
     }
-    if (!f) { if (g_init_event) SetEvent(g_init_event); return -1; }
+    if (!f) { ml_log_security_event("ML engine: model file not found; ML layer disabled"); if (g_init_event) SetEvent(g_init_event); return -1; }
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (fsize <= 0 || fsize > MAX_FILE_SIZE) { fclose(f); if (g_init_event) SetEvent(g_init_event); return -1; }
+    if (fsize <= 0 || fsize > MAX_FILE_SIZE) { fclose(f); ml_log_security_event("ML engine: model size out of bounds; ML layer disabled"); if (g_init_event) SetEvent(g_init_event); return -1; }
 
-    uint32_t magic = 0;
-    if (fread(&magic, 4, 1, f) != 1 || magic != FOREST_MAGIC) {
-        fclose(f); if (g_init_event) SetEvent(g_init_event); return -1;
+    /* Read the whole model into memory so it can be authenticated and parsed. */
+    uint8_t *model = (uint8_t *)malloc((size_t)fsize);
+    if (!model) { fclose(f); if (g_init_event) SetEvent(g_init_event); return -1; }
+    if (fread(model, 1, (size_t)fsize, f) != (size_t)fsize) {
+        free(model); fclose(f); if (g_init_event) SetEvent(g_init_event); return -1;
     }
-
-    BinaryForest *forest = (BinaryForest*)calloc(1, sizeof(BinaryForest));
-    if (!forest) { fclose(f); return -1; }
-
-    if (fread(&forest->num_trees, 4, 1, f) != 1 || fread(&forest->num_features, 4, 1, f) != 1) {
-        free(forest); fclose(f); if (g_init_event) SetEvent(g_init_event); return -1;
-    }
-    if (forest->num_trees == 0 || forest->num_trees > MAX_TREES || forest->num_features != EXPECTED_FEATURES) {
-        free(forest); fclose(f); if (g_init_event) SetEvent(g_init_event); return -1;
-    }
-
-    forest->trees = (BinaryTree*)calloc(forest->num_trees, sizeof(BinaryTree));
-    if (!forest->trees) { free(forest); fclose(f); return -1; }
-
-    for (uint32_t i=0;i<forest->num_trees;i++) {
-        uint32_t n_nodes;
-        if (fread(&n_nodes, 4, 1, f) != 1 || n_nodes==0 || n_nodes > MAX_NODES_PER_TREE) goto fail;
-        forest->trees[i].num_nodes = n_nodes;
-        forest->trees[i].nodes = (ForestNode*)malloc(n_nodes * sizeof(ForestNode));
-        if (!forest->trees[i].nodes) goto fail;
-        if (fread(forest->trees[i].nodes, sizeof(ForestNode), n_nodes, f) != n_nodes) goto fail;
-    }
-
     fclose(f);
+
+    /* R-02: verify the Ed25519 signature before touching the model contents. */
+    uint8_t sig[64] = {0};
+    if (read_sig_file(path, sig) != 0) {
+        free(model);
+        ml_log_security_event("ML engine: signature file missing; refusing to load model");
+        if (g_init_event) SetEvent(g_init_event);
+        return -1;
+    }
+    if (ed25519_verify(sig, sizeof(sig), model, (size_t)fsize, k_ed25519_pubkey) != 0) {
+        free(model);
+        ml_log_security_event("ML engine: Ed25519 signature INVALID - model rejected (possible tampering)");
+        if (g_init_event) SetEvent(g_init_event);
+        return -1;
+    }
+
+    /* Parse the authenticated model from memory. */
+    size_t off = 0;
+    uint32_t magic = 0;
+    if (fsize < 4) { free(model); if (g_init_event) SetEvent(g_init_event); return -1; }
+    memcpy(&magic, model + off, 4); off += 4;
+    if (magic != FOREST_MAGIC) {
+        free(model); ml_log_security_event("ML engine: bad FORE magic - model rejected"); if (g_init_event) SetEvent(g_init_event); return -1;
+    }
+
+    BinaryForest *forest = (BinaryForest *)calloc(1, sizeof(BinaryForest));
+    if (!forest) { free(model); return -1; }
+
+    if (fsize - off < 8) { free(forest); free(model); if (g_init_event) SetEvent(g_init_event); return -1; }
+    memcpy(&forest->num_trees, model + off, 4); off += 4;
+    memcpy(&forest->num_features, model + off, 4); off += 4;
+    if (forest->num_trees == 0 || forest->num_trees > MAX_TREES || forest->num_features != EXPECTED_FEATURES) {
+        free(forest); free(model); ml_log_security_event("ML engine: bad tree/feature counts - model rejected"); if (g_init_event) SetEvent(g_init_event); return -1;
+    }
+
+    forest->trees = (BinaryTree *)calloc(forest->num_trees, sizeof(BinaryTree));
+    if (!forest->trees) { free(forest); free(model); return -1; }
+
+    for (uint32_t i = 0; i < forest->num_trees; i++) {
+        uint32_t n_nodes;
+        if (fsize - off < 4) goto fail;
+        memcpy(&n_nodes, model + off, 4); off += 4;
+        if (n_nodes == 0 || n_nodes > MAX_NODES_PER_TREE) goto fail;
+        size_t bytes = (size_t)n_nodes * sizeof(ForestNode);
+        if (bytes > (size_t)(fsize - off)) goto fail;
+        forest->trees[i].num_nodes = n_nodes;
+        forest->trees[i].nodes = (ForestNode *)malloc(bytes);
+        if (!forest->trees[i].nodes) goto fail;
+        memcpy(forest->trees[i].nodes, model + off, bytes); off += bytes;
+    }
+
+    free(model);
     EnterCriticalSection(&g_forest_lock);
     g_forest = forest;
     LeaveCriticalSection(&g_forest_lock);
     if (g_init_event) SetEvent(g_init_event);
     return 0;
 fail:
-    for (uint32_t j=0;j<forest->num_trees;j++) free(forest->trees[j].nodes);
-    free(forest->trees); free(forest); fclose(f);
+    for (uint32_t j = 0; j < forest->num_trees; j++) free(forest->trees[j].nodes);
+    free(forest->trees); free(forest); free(model);
+    ml_log_security_event("ML engine: malformed model structure - model rejected");
     if (g_init_event) SetEvent(g_init_event);
     return -1;
 }
