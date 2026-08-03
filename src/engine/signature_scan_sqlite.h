@@ -32,6 +32,10 @@ typedef struct {
     sqlite3 *db;
     sqlite3_stmt *lookup_stmt;
     bool is_open;
+    /* Staging buffer for the last looked-up label: sqlite3_column_text()
+     * pointers are invalidated by sqlite3_reset(), so the label is copied
+     * here before the statement is reset. Valid until the next lookup. */
+    char label_buf[256];
 } SigHashDb;
 
 /* ============================================================================

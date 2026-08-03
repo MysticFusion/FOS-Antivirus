@@ -7,6 +7,7 @@
 #include "signature_scan.h"
 #include "signature_scan_sqlite.h"
 #include "hash_util.h"
+#include "db_hmac.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -173,6 +174,10 @@ const char *update_error_code_to_message(int code) {
         case UPDATE_ERR_PYTHON_TIMEOUT:
             return "Update failed: the hash aggregator script timed out after 30 minutes. "
                    "Check your network connection.";
+        case UPDATE_ERR_HMAC_WRITE:
+            return "Update failed: the signature database integrity file could not be "
+                   "written (insufficient permissions?). The database location requires "
+                   "administrator rights to update.";
         default:
             return "Update failed due to an unknown error.";
     }
@@ -264,6 +269,12 @@ static bool is_sqlite_database(const char *path) {
 }
 
 static int load_signature_file_unlocked(const char *sigdb_path) {
+    /* I-22/R-09: refuse to load databases whose HMAC-SHA256 integrity file
+     * is missing or mismatched. */
+    if (db_hmac_verify_file(sigdb_path) != 0) {
+        return -1;
+    }
+
     /* Check if this is a SQLite database */
     if (is_sqlite_database(sigdb_path)) {
         SigHashDb *db = sig_db_open(sigdb_path);
@@ -303,31 +314,23 @@ static int load_signature_file_unlocked(const char *sigdb_path) {
  * ========================================================================== */
 
 /**
- * @brief Search for hash_aggregator.py next to the EXE, then in source tree.
+ * @brief Locate hash_aggregator.py next to the EXE.
+ *
+ * I-04 hardening: only the staged location <exe_dir>\scripts\hash_aggregator.py
+ * is accepted (the CMake build copies the script there from the source tree).
+ * The previous fallbacks (<exe_dir>\hash_aggregator.py and
+ * <exe_dir>\..\scripts\...) are removed: they allowed executing a planted
+ * script from a writable application directory.
  */
 static bool find_aggregator_script(char *out_path, size_t out_sz) {
     char exe_dir[MAX_PATH] = {0};
-    if (GetModuleFileNameA(NULL, exe_dir, MAX_PATH) > 0) {
-        char *slash = strrchr(exe_dir, '\\');
-        if (slash) *slash = '\0';
+    if (GetModuleFileNameA(NULL, exe_dir, MAX_PATH) <= 0) return false;
+    char *slash = strrchr(exe_dir, '\\');
+    if (slash) *slash = '\0';
 
-        /* Try: <exe_dir>\scripts\hash_aggregator.py */
-        snprintf(out_path, out_sz, "%s\\scripts\\hash_aggregator.py", exe_dir);
-        if (GetFileAttributesA(out_path) != INVALID_FILE_ATTRIBUTES) {
-            return true;
-        }
-
-        /* Try: <exe_dir>\hash_aggregator.py */
-        snprintf(out_path, out_sz, "%s\\hash_aggregator.py", exe_dir);
-        if (GetFileAttributesA(out_path) != INVALID_FILE_ATTRIBUTES) {
-            return true;
-        }
-
-        /* Try: <exe_dir>\..\scripts\hash_aggregator.py (dev build) */
-        snprintf(out_path, out_sz, "%s\\..\\scripts\\hash_aggregator.py", exe_dir);
-        if (GetFileAttributesA(out_path) != INVALID_FILE_ATTRIBUTES) {
-            return true;
-        }
+    snprintf(out_path, out_sz, "%s\\scripts\\hash_aggregator.py", exe_dir);
+    if (GetFileAttributesA(out_path) != INVALID_FILE_ATTRIBUTES) {
+        return true;
     }
     return false;
 }
@@ -779,6 +782,15 @@ int update_signature_db(const char *db_path) {
     update_progress = 98;  /* Loading into engine */
     if (signature_db_validate_file(db_path) != 0) {
         update_error_code = UPDATE_ERR_INVALID_FORMAT;
+        update_progress = -1;
+        ReleaseSRWLockExclusive(&g_update_lock);
+        return -1;
+    }
+
+    /* 9b. Write the HMAC-SHA256 integrity file next to the DB (I-22/R-09).
+     * Load will refuse the DB without it. */
+    if (db_hmac_write_file(db_path) != 0) {
+        update_error_code = UPDATE_ERR_HMAC_WRITE;
         update_progress = -1;
         ReleaseSRWLockExclusive(&g_update_lock);
         return -1;

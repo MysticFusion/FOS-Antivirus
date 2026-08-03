@@ -105,7 +105,17 @@ int sig_db_lookup_hash(SigHashDb *db, const unsigned char hash[SHA256_SIZE],
 
     int result = 0;
     if (rc == SQLITE_ROW) {
-        *out_label = (const char *)sqlite3_column_text(db->lookup_stmt, 0);
+        /* Copy before sqlite3_reset() — the column pointer is invalid
+         * afterwards. */
+        const unsigned char *txt = sqlite3_column_text(db->lookup_stmt, 0);
+        db->label_buf[0] = '\0';
+        if (txt != NULL) {
+            size_t len = strlen((const char *)txt);
+            if (len >= sizeof(db->label_buf)) len = sizeof(db->label_buf) - 1;
+            memcpy(db->label_buf, txt, len);
+            db->label_buf[len] = '\0';
+        }
+        *out_label = db->label_buf[0] != '\0' ? db->label_buf : NULL;
         result = 1;  /* Match found */
     } else if (rc == SQLITE_DONE) {
         *out_label = NULL;
