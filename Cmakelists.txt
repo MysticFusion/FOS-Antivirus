@@ -194,6 +194,24 @@ if(BUILD_TESTING)
     target_include_directories(unit_test_ransomware_signals PRIVATE ${TEST_INCLUDE_DIRS})
     add_test(NAME unit_test_ransomware_signals COMMAND unit_test_ransomware_signals)
 
+    # R-07 hardened heuristics (I-10 / I-20): PE-aware signals, exact
+    # known-folder path validation, synthetic-PE parsing.
+    add_executable(unit_test_heuristic_pe
+        tests/unit/test_heuristic_pe.c
+        ${UNITY_SOURCES}
+        src/engine/feature_extract.c
+        src/engine/heuristic_engine.c
+        src/utils/path_utils.c
+    )
+    target_include_directories(unit_test_heuristic_pe PRIVATE ${TEST_INCLUDE_DIRS})
+    target_link_libraries(unit_test_heuristic_pe PRIVATE
+        shlwapi
+        shell32
+        ole32
+        uuid
+    )
+    add_test(NAME unit_test_heuristic_pe COMMAND unit_test_heuristic_pe)
+
     # Ed25519 model-signature verification (known-answer + end-to-end)
     add_executable(security_test_model_signature
         tests/security/test_model_signature.c
@@ -216,6 +234,12 @@ if(BUILD_TESTING)
         src/utils/path_utils.c
     )
     target_include_directories(security_test_ml_scores PRIVATE ${TEST_INCLUDE_DIRS})
+    target_link_libraries(security_test_ml_scores PRIVATE
+        shlwapi
+        shell32
+        ole32
+        uuid
+    )
     add_test(NAME security_test_ml_scores
         COMMAND security_test_ml_scores
                 "${CMAKE_SOURCE_DIR}/assets/models/forest.bin")

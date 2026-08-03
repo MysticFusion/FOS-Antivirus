@@ -57,6 +57,15 @@ typedef struct {
     bool     in_startup_dir;   /**< True if in a standard persistence location */
     bool     high_entropy;     /**< True if entropy exceeds malware threshold */
     bool     known_bad_hash;   /**< True if hash matches known malware */
+
+    /* PE-aware signals (R-07 / I-20). Valid only when is_pe is true. */
+    int      pe_import_count;      /**< Number of import functions seen, -1 if not parsed */
+    bool     pe_suspicious_import; /**< CreateRemoteThread/VirtualAllocEx/WriteProcessMemory/SetWindowsHookEx/CreateService */
+    bool     pe_packer_marker;     /**< UPX/.MPRESS/.aspack section names, or high section entropy with tiny import table */
+    bool     pe_overlay;           /**< File size exceeds SizeOfImage (appended data) */
+    bool     pe_rwx_section;       /**< Section with MEM_EXECUTE|MEM_WRITE */
+    bool     pe_ep_outside_text;   /**< Entry point not inside the .text section */
+    uint32_t pe_resource_size;     /**< Resource directory size in bytes */
 } FileFeatures;
 
 /* ============================================================================

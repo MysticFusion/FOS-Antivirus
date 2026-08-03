@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#include <objbase.h>
+#include <shlobj.h>
 
 /* ============================================================================
  * Standard helper macros
@@ -238,19 +240,78 @@ static bool has_executable_extension_wide(const wchar_t *path) {
           _wcsicmp(ext, L".sys") == 0 || _wcsicmp(ext, L".scr") == 0);
 }
 
-static bool path_contains_wide(const wchar_t *path, const wchar_t *token) {
-  if (!path || !token)
+/* ============================================================================
+ * Internal Helpers: Exact Known-Folder Location Checks (R-07 / I-10)
+ *
+ * The old code used substring matching ("\\Temp\\", "\\Startup\\") which
+ * produced false positives for decoy directories like
+ * "C:\Program Files\Foo\Temp\evil.exe" or "C:\Backup\Downloads\bad.exe".
+ * These helpers require the file to actually live under the canonical
+ * system folder (or a subdirectory of it).
+ * ========================================================================== */
+
+static bool is_in_known_folder_wide(const wchar_t *path, REFKNOWNFOLDERID folder_id) {
+  if (!path)
     return false;
-  wchar_t path_lc[FOS_MAX_PATH];
-  wchar_t token_lc[64];
 
-  wcsncpy_s(path_lc, FOS_MAX_PATH, path, _TRUNCATE);
-  _wcslwr_s(path_lc, FOS_MAX_PATH);
+  /* fos_path_t may have prepended the "\\?\" long-path prefix. */
+  const wchar_t *p = path;
+  if (wcsncmp(p, L"\\\\?\\", 4) == 0)
+    p += 4;
 
-  wcsncpy_s(token_lc, 64, token, _TRUNCATE);
-  _wcslwr_s(token_lc, 64);
+  PWSTR folder_path = NULL;
+  if (FAILED(SHGetKnownFolderPath(folder_id, 0, NULL, &folder_path)))
+    return false;
 
-  return wcsstr(path_lc, token_lc) != NULL;
+  bool result = false;
+  size_t flen = wcslen(folder_path);
+  if (flen > 0 && _wcsnicmp(p, folder_path, flen) == 0) {
+    wchar_t sep = p[flen];
+    result = (sep == L'\\' || sep == L'/');
+  }
+  CoTaskMemFree(folder_path);
+  return result;
+}
+
+static bool is_in_dir_prefix_wide(const wchar_t *path, const wchar_t *dir) {
+  if (!path || !dir)
+    return false;
+
+  /* fos_path_t may have prepended the "\\?\" long-path prefix. */
+  const wchar_t *p = path;
+  if (wcsncmp(p, L"\\\\?\\", 4) == 0)
+    p += 4;
+
+  size_t dlen = wcslen(dir);
+  if (dlen == 0)
+    return false;
+  if (_wcsnicmp(p, dir, dlen) != 0)
+    return false;
+  wchar_t sep = p[dlen];
+  return (sep == L'\\' || sep == L'/');
+}
+
+/* The per-user Temp dir (GetTempPathW) and the system Temp dir are both
+ * canonical temp locations; anything else named "Temp" is not. */
+static bool is_in_known_temp_wide(const wchar_t *path) {
+  if (!path)
+    return false;
+
+  wchar_t tmp[MAX_PATH + 2] = {0};
+  DWORD n = GetTempPathW(MAX_PATH, tmp);
+  if (n == 0 || n > MAX_PATH)
+    return false;
+  while (n > 0 && (tmp[n - 1] == L'\\' || tmp[n - 1] == L'/'))
+    tmp[--n] = L'\0';
+  if (is_in_dir_prefix_wide(path, tmp))
+    return true;
+
+  wchar_t sys_tmp[MAX_PATH + 2] = {0};
+  UINT wn = GetWindowsDirectoryW(sys_tmp, MAX_PATH);
+  if (wn == 0 || wn > MAX_PATH)
+    return false;
+  wcscat_s(sys_tmp, MAX_PATH + 2, L"\\Temp");
+  return is_in_dir_prefix_wide(path, sys_tmp);
 }
 
 /* ============================================================================
@@ -409,6 +470,11 @@ static void parse_pe(const uint8_t *data, size_t size, FileFeatures *feat) {
     return;
   }
 
+  /* R-07 (I-20) PE-aware signals gathered while walking the sections. */
+  uint32_t rwx_chars = (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE);
+  DWORD text_va = 0, text_vsize = 0;
+  bool has_rwx = false, has_packer_name = false;
+
   for (int i = 0; i < (int)num_sections; i++) {
     char sec_name[9] = {0};
     memcpy(sec_name, section[i].Name, 8);
@@ -417,6 +483,23 @@ static void parse_pe(const uint8_t *data, size_t size, FileFeatures *feat) {
     char chars_buf[16];
     sprintf(chars_buf, "%u", (unsigned int)section[i].Characteristics);
     hash_feature_str(v, chars_buf, FEAT_IDX_SECTIONS_BASE, 256);
+
+    if ((section[i].Characteristics & rwx_chars) == rwx_chars)
+      has_rwx = true;
+
+    /* Packer section-name markers (UPX*, .MPRESS, .aspack). Names are
+     * space-padded to 8 bytes; compare the meaningful prefix. */
+    if (_strnicmp(sec_name, "UPX", 3) == 0 ||
+        _strnicmp(sec_name, ".MPRESS", 7) == 0 ||
+        _strnicmp(sec_name, ".aspack", 7) == 0 ||
+        _strnicmp(sec_name, ".packed", 7) == 0) {
+      has_packer_name = true;
+    }
+
+    if (_stricmp(sec_name, ".text") == 0) {
+      text_va = section[i].VirtualAddress;
+      text_vsize = section[i].Misc.VirtualSize;
+    }
 
     DWORD raw_offset = section[i].PointerToRawData;
     DWORD raw_size = section[i].SizeOfRawData;
@@ -440,8 +523,30 @@ static void parse_pe(const uint8_t *data, size_t size, FileFeatures *feat) {
     v[FEAT_IDX_MEAN_SECTION_ENT] = (float)(total_entropy / num_sections);
   }
 
+  feat->pe_rwx_section = has_rwx;
+
+  /* R-07: anomalous entry point — EP outside the .text section. */
+  DWORD ep = nt->OptionalHeader.AddressOfEntryPoint;
+  if (ep != 0 && text_va != 0) {
+    feat->pe_ep_outside_text =
+        !(ep >= text_va && ep < text_va + text_vsize);
+  }
+
+  /* R-07: overlay — file data beyond SizeOfImage (appended payload). */
+  if (nt->OptionalHeader.SizeOfImage > 0 &&
+      size > nt->OptionalHeader.SizeOfImage) {
+    feat->pe_overlay = true;
+  }
+
+  /* R-07: oversized resource directory. */
+  if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_RESOURCE) {
+    feat->pe_resource_size =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size;
+  }
+
   /* Imports (Hash libs + funcs, FEAT_IDX_IMPORTS_BASE .. +1023) */
   float total_imports = 0.0f;
+  bool suspicious_import = false;
   if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
     DWORD import_rva =
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
@@ -452,9 +557,18 @@ static void parse_pe(const uint8_t *data, size_t size, FileFeatures *feat) {
           import_offset + sizeof(IMAGE_IMPORT_DESCRIPTOR) <= size) {
         PIMAGE_IMPORT_DESCRIPTOR imports =
             (PIMAGE_IMPORT_DESCRIPTOR)(data + import_offset);
+        DWORD import_dir_size =
+            nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+                .Size;
+        const uint8_t *import_end =
+            (import_dir_size > 0)
+                ? data + import_offset + import_dir_size
+                : data + size;
 
         while ((uint8_t *)imports + sizeof(IMAGE_IMPORT_DESCRIPTOR) <=
                    (data + size) &&
+               (uint8_t *)imports + sizeof(IMAGE_IMPORT_DESCRIPTOR) <=
+                   import_end &&
                imports->Name != 0) {
           DWORD name_offset = rva_to_offset(nt, imports->Name, size);
           char lib_name[256] = {0};
@@ -501,6 +615,23 @@ static void parse_pe(const uint8_t *data, size_t size, FileFeatures *feat) {
                     snprintf(full_import, sizeof(full_import), "%s:%.*s",
                              lib_name, f_len, func_name);
                     hash_feature_str(v, full_import, FEAT_IDX_IMPORTS_BASE, 1024);
+
+                    /* R-07 (I-20): suspicious API usage (process injection /
+                     * persistence primitives). */
+                    static const char *k_suspicious[] = {
+                        "createremotethread", "virtualallocex",
+                        "writeprocessmemory", "setwindowshookex",
+                        "createservice"};
+                    for (size_t s = 0;
+                         s < sizeof(k_suspicious) / sizeof(k_suspicious[0]);
+                         s++) {
+                      if (f_len == (int)strlen(k_suspicious[s]) &&
+                          _strnicmp(func_name, k_suspicious[s],
+                                    strlen(k_suspicious[s])) == 0) {
+                        suspicious_import = true;
+                        break;
+                      }
+                    }
                   }
                 }
 
@@ -515,6 +646,15 @@ static void parse_pe(const uint8_t *data, size_t size, FileFeatures *feat) {
     }
   }
   v[FEAT_IDX_IMPORT_COUNT] = total_imports;
+  feat->pe_import_count = (int)total_imports;
+  feat->pe_suspicious_import = suspicious_import;
+
+  /* R-07 (I-20): packer — marker section names, or high mean section
+   * entropy with a very small import table (packed/compressed code). */
+  if (has_packer_name ||
+      (v[FEAT_IDX_MEAN_SECTION_ENT] > 7.0f && total_imports < 10.0f)) {
+    feat->pe_packer_marker = true;
+  }
 
   /* Exports (FEAT_IDX_EXPORTS_BASE .. +255) */
   if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
@@ -616,14 +756,12 @@ int extract_file_features_wide(const fos_path_t *path, FileFeatures *out) {
   out->vector[FEAT_IDX_FILE_ENTROPY] = (float)ent;
   out->high_entropy = (ent > 7.2);
 
-  out->in_temp_dir =
-      path_contains_wide(path->wide, L"\\Temp\\") ||
-      path_contains_wide(path->wide, L"\\tmp\\");
-  out->in_downloads_dir = path_contains_wide(path->wide, L"\\Downloads\\");
+  out->in_temp_dir = is_in_known_temp_wide(path->wide);
+  out->in_downloads_dir =
+      is_in_known_folder_wide(path->wide, &FOLDERID_Downloads);
   out->in_startup_dir =
-      path_contains_wide(path->wide, L"\\Startup\\") ||
-      path_contains_wide(path->wide,
-                         L"\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+      is_in_known_folder_wide(path->wide, &FOLDERID_Startup) ||
+      is_in_known_folder_wide(path->wide, &FOLDERID_CommonStartup);
 
   analyze_strings(data, size, out->vector);
   parse_pe(data, size, out);

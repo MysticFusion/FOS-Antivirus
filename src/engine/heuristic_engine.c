@@ -68,18 +68,60 @@ void evaluate_heuristics(
     }
 
     if (f->in_temp_dir) {
-        score += 25;
+        score += 15;
         append_reason(reasons, sizeof(reasons), "Temp-dir;");
     }
 
     if (f->in_startup_dir) {
-        score += 35;
+        score += 25;
         append_reason(reasons, sizeof(reasons), "Startup-loc;");
     }
 
     if (f->high_entropy) {
         score += 20;
         append_reason(reasons, sizeof(reasons), "High-entropy;");
+    }
+
+    /* ========================================================================
+     * PE-Aware Signals (R-07 / I-20)
+     *
+     * Static analysis of the portable-executable structure, only meaningful
+     * for files with a valid PE header.
+     * ======================================================================== */
+
+    if (f->is_pe && f->pe_suspicious_import) {
+        score += 20;
+        append_reason(reasons, sizeof(reasons), "Suspicious-imports;");
+    }
+
+    if (f->is_pe && f->pe_packer_marker) {
+        score += 25;
+        append_reason(reasons, sizeof(reasons), "Packer-marker;");
+    }
+
+    if (f->is_pe && f->pe_import_count == 0) {
+        score += 15;
+        append_reason(reasons, sizeof(reasons), "No-imports;");
+    }
+
+    if (f->is_pe && f->pe_overlay) {
+        score += 10;
+        append_reason(reasons, sizeof(reasons), "Overlay;");
+    }
+
+    if (f->is_pe && f->pe_rwx_section) {
+        score += 20;
+        append_reason(reasons, sizeof(reasons), "RWX-section;");
+    }
+
+    if (f->is_pe && f->pe_ep_outside_text) {
+        score += 15;
+        append_reason(reasons, sizeof(reasons), "Anomalous-EP;");
+    }
+
+    if (f->is_pe && f->pe_resource_size > (1024u * 1024u)) {
+        score += 10;
+        append_reason(reasons, sizeof(reasons), "Resource-heavy;");
     }
 
     /* ========================================================================
