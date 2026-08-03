@@ -138,6 +138,16 @@ int scan_core_scan_file(
 );
 
 /**
+ * @brief Scan a single file addressed by a wide-character path (no W->A
+ *        round-trip through the caller). Long-path safe.
+ */
+int scan_core_scan_file_wide(
+    const char *sigdb_path,
+    const wchar_t *file_path,
+    ScanReason  reason
+);
+
+/**
  * @brief Get the number of pending tasks in the scan queue.
  */
 long scan_core_get_pending_tasks(void);

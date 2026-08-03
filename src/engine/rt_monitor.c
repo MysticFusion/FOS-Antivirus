@@ -94,41 +94,40 @@ static DWORD WINAPI rt_thread_proc(LPVOID param) {
       if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_MODIFIED || fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
         if (is_interesting_file(full_path)) {
           char utf8_path[MAX_PATH];
-          if (wide_to_utf8(full_path, utf8_path, sizeof(utf8_path))) {
-            if (fni->Action == FILE_ACTION_ADDED) {
-              WIN32_FILE_ATTRIBUTE_DATA attrs;
-              if (GetFileAttributesExW(full_path, GetFileExInfoStandard, &attrs)) {
-                if (attrs.nFileSizeLow == 0 && attrs.nFileSizeHigh == 0) goto next_entry;
-                if (attrs.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) goto next_entry;
-              }
+          wide_to_utf8(full_path, utf8_path, sizeof(utf8_path));
+          if (fni->Action == FILE_ACTION_ADDED) {
+            WIN32_FILE_ATTRIBUTE_DATA attrs;
+            if (GetFileAttributesExW(full_path, GetFileExInfoStandard, &attrs)) {
+              if (attrs.nFileSizeLow == 0 && attrs.nFileSizeHigh == 0) goto next_entry;
+              if (attrs.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) goto next_entry;
             }
-            ScanReason reason = SCAN_REASON_RT_MODIFY;
-            time_t now = time(NULL);
-            if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
-              ensure_lock();
-              EnterCriticalSection(&g_rt_lock);
-              g_burst_timestamps[g_burst_head] = now;
-              g_burst_head = (g_burst_head + 1) % BURST_THRESHOLD;
-              time_t oldest = g_burst_timestamps[g_burst_head];
-              LeaveCriticalSection(&g_rt_lock);
-              if (oldest > 0 && (now - oldest) <= BURST_WINDOW_SEC) {
-                reason = SCAN_REASON_RANSOMWARE_BURST;
-                printf("[RT-MONITOR] !!! RANSOMWARE BURST DETECTED: %s !!!\n", utf8_path);
-              } else {
-                reason = SCAN_REASON_RT_CREATE;
-              }
-            }
+          }
+          ScanReason reason = SCAN_REASON_RT_MODIFY;
+          time_t now = time(NULL);
+          if (fni->Action == FILE_ACTION_ADDED || fni->Action == FILE_ACTION_RENAMED_NEW_NAME) {
             ensure_lock();
             EnterCriticalSection(&g_rt_lock);
-            bool should_scan = (strcmp(utf8_path, g_last_log_path) != 0 || (now - g_last_log_time) > LOG_DEDUP_INTERVAL_SEC);
-            if (should_scan) {
-              strncpy_s(g_last_log_path, sizeof(g_last_log_path), utf8_path, _TRUNCATE);
-              g_last_log_time = now;
-            }
+            g_burst_timestamps[g_burst_head] = now;
+            g_burst_head = (g_burst_head + 1) % BURST_THRESHOLD;
+            time_t oldest = g_burst_timestamps[g_burst_head];
             LeaveCriticalSection(&g_rt_lock);
-            if (should_scan) {
-              scan_core_scan_file(g_sigdb_path, utf8_path, reason);
+            if (oldest > 0 && (now - oldest) <= BURST_WINDOW_SEC) {
+              reason = SCAN_REASON_RANSOMWARE_BURST;
+              printf("[RT-MONITOR] !!! RANSOMWARE BURST DETECTED: %s !!!\n", utf8_path);
+            } else {
+              reason = SCAN_REASON_RT_CREATE;
             }
+          }
+          ensure_lock();
+          EnterCriticalSection(&g_rt_lock);
+          bool should_scan = (strcmp(utf8_path, g_last_log_path) != 0 || (now - g_last_log_time) > LOG_DEDUP_INTERVAL_SEC);
+          if (should_scan) {
+            strncpy_s(g_last_log_path, sizeof(g_last_log_path), utf8_path, _TRUNCATE);
+            g_last_log_time = now;
+          }
+          LeaveCriticalSection(&g_rt_lock);
+          if (should_scan) {
+            scan_core_scan_file_wide(g_sigdb_path, full_path, reason);
           }
         }
       }

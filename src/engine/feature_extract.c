@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "feature_extract.h"
+#include "path_utils.h"
 #include <ctype.h>
 #include <math.h>
 #include <stdio.h>
@@ -229,29 +230,27 @@ static void calc_histograms(const uint8_t *data, size_t size, float *vec) {
   }
 }
 
-static bool has_executable_extension(const char *path) {
-  const char *ext = strrchr(path, '.');
+static bool has_executable_extension_wide(const wchar_t *path) {
+  const wchar_t *ext = wcsrchr(path, L'.');
   if (!ext)
     return false;
-  return (_stricmp(ext, ".exe") == 0 || _stricmp(ext, ".dll") == 0 ||
-          _stricmp(ext, ".sys") == 0 || _stricmp(ext, ".scr") == 0);
+  return (_wcsicmp(ext, L".exe") == 0 || _wcsicmp(ext, L".dll") == 0 ||
+          _wcsicmp(ext, L".sys") == 0 || _wcsicmp(ext, L".scr") == 0);
 }
 
-static bool path_contains(const char *path, const char *token) {
+static bool path_contains_wide(const wchar_t *path, const wchar_t *token) {
   if (!path || !token)
     return false;
-  char path_lc[MAX_PATH];
-  char token_lc[64];
+  wchar_t path_lc[FOS_MAX_PATH];
+  wchar_t token_lc[64];
 
-  strncpy(path_lc, path, MAX_PATH - 1);
-  path_lc[MAX_PATH - 1] = 0;
-  _strlwr(path_lc);
+  wcsncpy_s(path_lc, FOS_MAX_PATH, path, _TRUNCATE);
+  _wcslwr_s(path_lc, FOS_MAX_PATH);
 
-  strncpy(token_lc, token, sizeof(token_lc) - 1);
-  token_lc[sizeof(token_lc) - 1] = 0;
-  _strlwr(token_lc);
+  wcsncpy_s(token_lc, 64, token, _TRUNCATE);
+  _wcslwr_s(token_lc, 64);
 
-  return strstr(path_lc, token_lc) != NULL;
+  return wcsstr(path_lc, token_lc) != NULL;
 }
 
 /* ============================================================================
@@ -557,13 +556,13 @@ static void parse_pe(const uint8_t *data, size_t size, FileFeatures *feat) {
  * Public Functions
  * ========================================================================== */
 
-int extract_file_features(const char *path, FileFeatures *out) {
+int extract_file_features_wide(const fos_path_t *path, FileFeatures *out) {
   if (!path || !out)
     return -1;
   memset(out, 0, sizeof(FileFeatures));
 
-  HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                             OPEN_EXISTING, 0, NULL);
+  HANDLE hFile = CreateFileW(path->wide, GENERIC_READ, FILE_SHARE_READ, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
   if (hFile == INVALID_HANDLE_VALUE) {
     out->exists = false;
     return -2;
@@ -576,7 +575,7 @@ int extract_file_features(const char *path, FileFeatures *out) {
   }
 
   out->exists = true;
-  out->is_executable = has_executable_extension(path);
+  out->is_executable = has_executable_extension_wide(path->wide);
   out->vector[FEAT_IDX_FILE_SIZE] = (float)fs.QuadPart;
 
   if (fs.QuadPart == 0) {
@@ -584,7 +583,7 @@ int extract_file_features(const char *path, FileFeatures *out) {
     return 0;
   }
 
-  HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+  HANDLE hMap = CreateFileMappingW(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
   if (!hMap) {
     CloseHandle(hFile);
     return -1;
@@ -618,12 +617,13 @@ int extract_file_features(const char *path, FileFeatures *out) {
   out->high_entropy = (ent > 7.2);
 
   out->in_temp_dir =
-      path_contains(path, "\\Temp\\") || path_contains(path, "\\tmp\\");
-  out->in_downloads_dir = path_contains(path, "\\Downloads\\");
+      path_contains_wide(path->wide, L"\\Temp\\") ||
+      path_contains_wide(path->wide, L"\\tmp\\");
+  out->in_downloads_dir = path_contains_wide(path->wide, L"\\Downloads\\");
   out->in_startup_dir =
-      path_contains(path, "\\Startup\\") ||
-      path_contains(path,
-                    "\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+      path_contains_wide(path->wide, L"\\Startup\\") ||
+      path_contains_wide(path->wide,
+                         L"\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
 
   analyze_strings(data, size, out->vector);
   parse_pe(data, size, out);
@@ -633,6 +633,15 @@ int extract_file_features(const char *path, FileFeatures *out) {
   CloseHandle(hFile);
 
   return 0;
+}
+
+int extract_file_features(const char *path, FileFeatures *out) {
+  if (!path || !out)
+    return -1;
+  fos_path_t fp;
+  if (!fos_path_init(&fp, path))
+    return -1;
+  return extract_file_features_wide(&fp, out);
 }
 
 /* Test-support hook (not part of the public API): exported only when the

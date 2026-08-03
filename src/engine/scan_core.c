@@ -16,6 +16,7 @@
 #include "scan_report_bridge.h"
 #include "signature_scan.h"
 #include "trust.h"
+#include "path_utils.h"
 #include "ui_scan_paths.h"
 #include <glib.h>
 #include <shlwapi.h>
@@ -39,11 +40,11 @@ static HANDLE g_backpressure_event = NULL;
 
 static const char *g_allowed_exts[] = {".exe",".dll",".sys",".scr",".cpl",".ocx",".drv",".com",".bat",".cmd",".ps1",".vbs",".vbe",".js",".jse",".hta",".wsf",".wsh",".msi",".msp",".docm",".xlsm",".pptm",NULL};
 
-static bool is_file_older_than_days(const char *path, int days)
+static bool is_file_older_than_days_wide(const wchar_t *path, int days)
 {
     if (!path || days<=0) return false;
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &fad)) return false;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return false;
     if (fad.ftLastWriteTime.dwLowDateTime==0 && fad.ftLastWriteTime.dwHighDateTime==0) return false;
     FILETIME now; GetSystemTimeAsFileTime(&now);
     ULARGE_INTEGER ulNow, ulWrite;
@@ -52,6 +53,14 @@ static bool is_file_older_than_days(const char *path, int days)
     const ULONGLONG diff = ulNow.QuadPart > ulWrite.QuadPart ? ulNow.QuadPart - ulWrite.QuadPart : 0;
     ULONGLONG days100ns = (ULONGLONG)days * 24 * 60 * 60 * 10000000ULL;
     return diff > days100ns;
+}
+
+static bool is_file_older_than_days(const char *path, int days)
+{
+    if (!path || days<=0) return false;
+    fos_path_t fp;
+    if (!fos_path_init(&fp, path)) return false;
+    return is_file_older_than_days_wide(fp.wide, days);
 }
 
 static bool is_persistence_path(const char *path)
@@ -104,6 +113,13 @@ static void scan_single_file_internal(const char *path, ScanReason reason, bool 
         return;
     }
 
+    fos_path_t fp;
+    if (!fos_path_init(&fp, path)) {
+        scan_progress_file_done(false);
+        finish_task();
+        return;
+    }
+
     ScanInput *input = (ScanInput*)calloc(1, sizeof(*input));
     if (!input) { scan_progress_file_done(false); finish_task(); return; }
     input->path = _strdup(path);
@@ -116,7 +132,7 @@ static void scan_single_file_internal(const char *path, ScanReason reason, bool 
         return;
     }
 
-    if (compute_file_sha256(path, input->hash) != 0) {
+    if (compute_file_sha256_wide(&fp, input->hash) != 0) {
         scan_progress_file_done(false);
         g_free(input->path);
         free(input);
@@ -138,7 +154,7 @@ static void scan_single_file_internal(const char *path, ScanReason reason, bool 
         return;
     }
 
-    if (extract_file_features(path, &input->features) == 0) {
+    if (extract_file_features_wide(&fp, &input->features) == 0) {
         evaluate_heuristics(&input->features, &heur, trust, reason);
         if (trust == TRUST_NONE) ml_score = ml_engine_scan(&input->features);
     }
@@ -286,6 +302,22 @@ int scan_core_scan_file(const char *sigdb_path, const char *file_path, ScanReaso
     if (!file_path) return SCANCORE_FILE_ERR;
     if (signature_db_load(sigdb_path)!=0) return SCANCORE_FILE_ERR;
     return enqueue_scan_task(file_path, reason, false);
+}
+
+int scan_core_scan_file_wide(const char *sigdb_path, const wchar_t *file_path, ScanReason reason)
+{
+    (void)sigdb_path;
+    if (!file_path) return SCANCORE_FILE_ERR;
+    if (signature_db_load(sigdb_path)!=0) return SCANCORE_FILE_ERR;
+
+    /* Wide -> UTF-8 once (the scan pipeline is char-based up to the per-file
+     * fos_path_t conversion). Uses a full FOS_MAX_PATH buffer so deep paths
+     * are not truncated like the old MAX_PATH round-trip. */
+    char utf8_path[FOS_MAX_PATH * 4];
+    fos_path_t fp;
+    if (!fos_path_init_w(&fp, file_path)) return SCANCORE_FILE_ERR;
+    if (fos_path_to_utf8(&fp, utf8_path, sizeof(utf8_path)) != 0) return SCANCORE_FILE_ERR;
+    return enqueue_scan_task(utf8_path, reason, false);
 }
 
 bool scan_core_is_complete(void) { return InterlockedCompareExchange(&g_pending_tasks,0,0)==0 && scan_report_is_idle(); }

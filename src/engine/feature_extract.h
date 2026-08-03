@@ -16,6 +16,7 @@ extern "C" {
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "path_utils.h"
 
 /* ============================================================================
  * Scan Reason Definitions
@@ -76,6 +77,17 @@ typedef struct {
  *         - -2: File not found or is a directory
  */
 int extract_file_features(const char *path, FileFeatures *out_features);
+
+/**
+ * @brief Long-path-safe variant: extract features from a file addressed by
+ *        a fos_path_t (wide path with automatic "\\?\" prefixing). No A->W
+ *        conversion is performed.
+ *
+ * @return 0 on success, negative error code on failure:
+ *         - -1: Invalid parameters
+ *         - -2: File not found or is a directory
+ */
+int extract_file_features_wide(const fos_path_t *path, FileFeatures *out_features);
 
 #ifdef __cplusplus
 }

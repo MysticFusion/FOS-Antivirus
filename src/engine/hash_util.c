@@ -1,5 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "hash_util.h"
+#include "path_utils.h"
 #include "sha2.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -9,29 +10,40 @@
 #define HASH_READ_BUFFER_SIZE 8192
 #define MAX_FILE_SIZE_FOR_HASH (500ULL*1024*1024)
 
-int compute_file_sha256(const char *path, unsigned char out_hash[SHA256_SIZE]) {
+int compute_file_sha256_wide(const fos_path_t *path, unsigned char out_hash[SHA256_SIZE]) {
   if (!path || !out_hash) return -1;
-  FILE *f = NULL;
-  if (fopen_s(&f, path, "rb") != 0 || !f) return -1;
+
+  HANDLE hFile = CreateFileW(path->wide, GENERIC_READ, FILE_SHARE_READ,
+                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (hFile == INVALID_HANDLE_VALUE) return -1;
 
   // Check file size to prevent huge file DoS
-  fseek(f, 0, SEEK_END);
-  long fsize = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  if (fsize < 0 || (unsigned long long)fsize > MAX_FILE_SIZE_FOR_HASH) { fclose(f); return -1; }
+  LARGE_INTEGER fsize;
+  if (!GetFileSizeEx(hFile, &fsize) || fsize.QuadPart < 0 ||
+      (unsigned long long)fsize.QuadPart > MAX_FILE_SIZE_FOR_HASH) {
+    CloseHandle(hFile);
+    return -1;
+  }
 
   sha256_ctx ctx;
   sha256_init(&ctx);
   unsigned char buffer[HASH_READ_BUFFER_SIZE];
-  size_t bytes_read;
-  while ((bytes_read = fread(buffer, 1, sizeof(buffer), f)) > 0) {
+  DWORD bytes_read;
+  while (ReadFile(hFile, buffer, sizeof(buffer), &bytes_read, NULL) && bytes_read > 0) {
     sha256_update(&ctx, buffer, bytes_read);
-    if (ferror(f)) { fclose(f); return -1; }
   }
-  if (ferror(f)) { fclose(f); return -1; }
-  fclose(f);
+  DWORD read_err = GetLastError();
+  CloseHandle(hFile);
+  if (read_err != ERROR_HANDLE_EOF && read_err != ERROR_SUCCESS) return -1;
   sha256_final(&ctx, out_hash);
   return 0;
+}
+
+int compute_file_sha256(const char *path, unsigned char out_hash[SHA256_SIZE]) {
+  if (!path || !out_hash) return -1;
+  fos_path_t fp;
+  if (!fos_path_init(&fp, path)) return -1;
+  return compute_file_sha256_wide(&fp, out_hash);
 }
 
 static uint64_t fnv1a_hash(const unsigned char *data, size_t len) {

@@ -23,7 +23,23 @@ bool fos_path_init(fos_path_t *p, const char *utf8_input)
         return false;
     }
 
-    size_t len = (size_t)(n - 1);
+    return fos_path_init_w(p, p->wide);
+}
+
+bool fos_path_init_w(fos_path_t *p, const wchar_t *wide_input)
+{
+    if (!p || !wide_input) {
+        return false;
+    }
+
+    size_t len = wcslen(wide_input);
+    if (len >= FOS_MAX_PATH) {
+        p->wide[0] = L'\0';
+        p->is_long = false;
+        return false;
+    }
+
+    wcscpy_s(p->wide, FOS_MAX_PATH, wide_input);
     p->is_long = false;
 
     if (len >= 248) {

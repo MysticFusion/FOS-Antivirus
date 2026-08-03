@@ -165,10 +165,12 @@ def build_helper(tmpdir):
         "-Wextra",
         "-DFOS_FEATURE_TEST_EXPORTS",
         f"-I{ENGINE_INC}",
+        "-I" + os.path.join(ROOT, "src", "utils"),
         "-o",
         exe,
         HELPER_SRC,
         EXTRACT_SRC,
+        os.path.join(ROOT, "src", "utils", "path_utils.c"),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:

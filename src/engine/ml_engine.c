@@ -3,6 +3,7 @@
  */
 #include "ml_engine.h"
 #include "ed25519_verify.h"
+#include "path_utils.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -75,14 +76,14 @@ static void ml_log_security_event(const char *msg)
 
 static int read_sig_file(const char *model_path, uint8_t sig[64])
 {
-    size_t plen = strlen(model_path);
-    if (plen + 5 > MAX_PATH) return -1;
-    char sig_path[MAX_PATH] = {0};
-    memcpy(sig_path, model_path, plen);
-    memcpy(sig_path + plen, ".sig", 5);
+    fos_path_t fp;
+    if (!fos_path_init(&fp, model_path)) return -1;
+    size_t plen = wcslen(fp.wide);
+    if (plen + 5 >= FOS_MAX_PATH) return -1;
+    wcscpy_s(fp.wide + plen, FOS_MAX_PATH - plen, L".sig");
 
-    FILE *f = NULL;
-    if (fopen_s(&f, sig_path, "rb") != 0 || !f) return -1;
+    FILE *f = fos_fopen(&fp, "rb");
+    if (!f) return -1;
     size_t got = fread(sig, 1, 64, f);
     int extra = (int)(fgetc(f) != EOF);
     fclose(f);
@@ -103,16 +104,17 @@ int ml_engine_init(const char *model_path)
         path = bin_path;
     }
 
+    fos_path_t fp;
     FILE *f = NULL;
-    if (fopen_s(&f, path, "rb") != 0 || !f) {
-        f = NULL;
+    if (fos_path_init(&fp, path)) f = fos_fopen(&fp, "rb");
+    if (!f) {
         /* Fallback: try the model relative to the executable directory */
         char exe_dir[MAX_PATH] = {0};
         GetModuleFileNameA(NULL, exe_dir, MAX_PATH);
         char *last = strrchr(exe_dir, '\\');
         if (last) *last = '\0';
         snprintf(bin_path, sizeof(bin_path), "%s\\ml\\models\\forest.bin", exe_dir);
-        if (fopen_s(&f, bin_path, "rb") != 0) f = NULL;
+        if (fos_path_init(&fp, bin_path)) f = fos_fopen(&fp, "rb");
         if (f) path = bin_path;
     }
     if (!f) { ml_log_security_event("ML engine: model file not found; ML layer disabled"); if (g_init_event) SetEvent(g_init_event); return -1; }

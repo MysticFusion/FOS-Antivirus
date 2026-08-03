@@ -15,6 +15,7 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include "path_utils.h"
 
 /* ============================================================================
  * Constants
@@ -38,6 +39,19 @@ extern "C" {
 int compute_file_sha256(
     const char    *path,
     unsigned char  out_hash[SHA256_SIZE]
+);
+
+/**
+ * @brief Long-path-safe variant: hash a file addressed by a fos_path_t
+ *        (wide path with automatic "\\?\" prefixing). No A->W conversion
+ *        is performed, so callers that already hold a wide path should
+ *        prefer this entry point.
+ *
+ * @return 0 on success, -1 on failure (e.g., file not found or inaccessible).
+ */
+int compute_file_sha256_wide(
+    const fos_path_t *path,
+    unsigned char     out_hash[SHA256_SIZE]
 );
 
 /* ============================================================================

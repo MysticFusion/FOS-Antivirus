@@ -43,6 +43,10 @@ typedef struct {
  */
 bool fos_path_init(fos_path_t *p, const char *utf8_input);
 
+/** @brief Initialize a fos_path_t directly from a UTF-16 string (no
+ *         UTF-8 round-trip). Applies the same prefixing rules. */
+bool fos_path_init_w(fos_path_t *p, const wchar_t *wide_input);
+
 /** @brief Return the wide string (with prefix applied). */
 const wchar_t *fos_path_w(const fos_path_t *p);
 
