@@ -125,6 +125,12 @@ else()
 endif()
 
 if(BUILD_TESTING)
+    set(UNITY_SOURCES tests/unity/unity.c)
+    set(TEST_INCLUDE_DIRS
+        ${CMAKE_SOURCE_DIR}/src/engine
+        ${CMAKE_SOURCE_DIR}/tests/unity
+    )
+
     add_executable(decision_policy_test
         tests/decision_policy_test.c
         src/engine/scan_executor.c
@@ -133,4 +139,62 @@ if(BUILD_TESTING)
         ${CMAKE_SOURCE_DIR}/src/engine
     )
     add_test(NAME decision_policy_test COMMAND decision_policy_test)
+
+    # SHA-2 known-answer vectors (NIST FIPS 180-2)
+    add_executable(unit_test_hash
+        tests/unit/test_hash.c
+        ${UNITY_SOURCES}
+        src/engine/sha2.c
+    )
+    target_include_directories(unit_test_hash PRIVATE ${TEST_INCLUDE_DIRS})
+    add_test(NAME unit_test_hash COMMAND unit_test_hash)
+
+    # Long-path conversion + deep-path file I/O
+    add_executable(unit_test_path_utils
+        tests/unit/test_path_utils.c
+        ${UNITY_SOURCES}
+        src/utils/path_utils.c
+    )
+    target_include_directories(unit_test_path_utils PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/utils
+        ${CMAKE_SOURCE_DIR}/tests/unity
+    )
+    add_test(NAME unit_test_path_utils COMMAND unit_test_path_utils)
+
+    # Ed25519 model-signature verification (known-answer + end-to-end)
+    add_executable(security_test_model_signature
+        tests/security/test_model_signature.c
+        ${UNITY_SOURCES}
+        src/engine/ed25519_verify.c
+        src/engine/ml_engine.c
+    )
+    target_include_directories(security_test_model_signature PRIVATE ${TEST_INCLUDE_DIRS})
+    add_test(NAME security_test_model_signature COMMAND security_test_model_signature)
+
+    # AES-256-GCM quarantine round-trip against the real DPAPI vault
+    add_executable(security_test_quarantine_crypto
+        tests/security/test_quarantine_crypto.c
+        ${UNITY_SOURCES}
+        src/engine/response_engine.c
+        src/app/app_paths.c
+        src/utils/path_utils.c
+    )
+    target_include_directories(security_test_quarantine_crypto PRIVATE
+        ${TEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/src/app
+        ${CMAKE_SOURCE_DIR}/src/utils
+    )
+    target_link_libraries(security_test_quarantine_crypto PRIVATE
+        shlwapi
+        urlmon
+        wintrust
+        shell32
+        ole32
+        oleaut32
+        uuid
+        advapi32
+        bcrypt
+        crypt32
+    )
+    add_test(NAME security_test_quarantine_crypto COMMAND security_test_quarantine_crypto)
 endif()
