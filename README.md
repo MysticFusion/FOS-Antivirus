@@ -20,7 +20,7 @@ It is a learning tool and a research prototype. It is **not** a production antiv
 - **Tiered Detection Pipeline** —
   1. SHA-256 signature lookup against a SQLite database of **1.1M+ known malware hashes**;
   2. Rule-based **heuristic scoring** of file characteristics and behaviors;
-  3. **Machine-learning classification** using a bundled decision-forest model.
+  3. **Machine-learning classification** using a bundled decision-forest model built based on Ember 2024 PE Dataset.
 - **Digital Signature Trust** — evaluates file signatures (e.g., Microsoft-signed binaries) to reduce false positives.
 - **Automatic Remediation** — quarantines detected threats into an isolated folder and keeps a full detection/quarantine history with restore support.
 - **Signature Database Updates** — one-click in-app update that aggregates malware hashes from five public, no-authentication threat-intelligence sources (MalwareBazaar, URLhaus, ThreatFox, ESET malware-ioc, TweetFeed).
@@ -70,9 +70,9 @@ FOS-Antivirus intentionally does **not** provide:
 | Requirement | Why | Install if missing |
 |---|---|---|
 | Windows 10/11 (64-bit) | Target platform | — |
-| Git | Cloning the repository | https://git-scm.com/download/win |
-| MSYS2 | Toolchain + package manager | https://www.msys2.org/ (install, then open the **MSYS2 MINGW64** shell) |
-| Python 3.8+ | Signature-database updates (optional but recommended) | https://www.python.org/downloads/ |
+| Git | Cloning the repository | https://git-scm.com/install/windows |
+| MSYS2 | Toolchain + package manager | https://www.msys2.org/ |
+| Python 3.8+ | Signature-database updates | https://www.python.org/downloads/ |
 
 ### 1. Install the build dependencies
 
@@ -89,9 +89,7 @@ pacman -S --needed \
   git
 ```
 
-### 2. Install the Python dependency (optional)
-
-Only needed if you want the app's "Update Now" feature to work:
+### 2. Install the Python dependency
 
 ```bash
 python -m pip install requests
@@ -121,7 +119,7 @@ The build automatically stages the ML model (`forest.bin`) and the Python aggreg
 ./build/FOS-Antivirus.exe
 ```
 
-**First run:** go to **Settings** and click **Update Now** to download and aggregate the signature database (1–5 minutes, depending on your connection — the largest feed is ~775 MB compressed). Scans work immediately for the bundled heuristics/ML model; signature hits require the database.
+**First run:** go to **Settings** and click **Update Now** to download and aggregate the signature database (~1 GB). Scans work immediately for the bundled heuristics/ML model; signature hits require the database.
 
 ### Optional: run the tests
 
