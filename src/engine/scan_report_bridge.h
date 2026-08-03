@@ -6,6 +6,9 @@
  * decision engine. It manages the lifecycle of scan reports and ensures
  * all tiered detection results are consolidated before a final decision.
  *
+ * I-13: the legacy parallel accumulation API (submit_signature /
+ * submit_heuristic and their record list) was removed -- the serial
+ * pipeline submits fully-aggregated results via scan_report_submit_complete.
  */
 
 #ifndef SCAN_REPORT_BRIDGE_H
@@ -40,24 +43,8 @@ void scan_report_bridge_shutdown(void);
 bool scan_report_is_idle(void);
 
 /* ============================================================================
- * Result Submission (Tiered Pipeline Support)
+ * Result Submission (Serial Pipeline)
  * ========================================================================== */
-
-/**
- * @brief Submit a signature-based detection result.
- */
-void scan_report_submit_signature(
-    ScanInput             *input,
-    const SignatureResult *sig
-);
-
-/**
- * @brief Submit a heuristic-based detection result.
- */
-void scan_report_submit_heuristic(
-    ScanInput              *input,
-    const HeuristicResult *heur
-);
 
 /**
  * @brief Complete a tiered scan session and trigger the final decision.
