@@ -102,7 +102,7 @@ TrustLevel trust_evaluate_path(const char *path, bool quick_mode) {
   WCHAR w_path[MAX_PATH];
   MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH);
 
-  PWSTR win_path = NULL, prog_path = NULL, prog86_path = NULL, data_path = NULL;
+  PWSTR prog_path = NULL, prog86_path = NULL, data_path = NULL;
   TrustLevel result = TRUST_NONE;
 
   /* 1. Digital Signature Verification */
@@ -140,3 +140,5 @@ TrustLevel trust_evaluate_path(const char *path, bool quick_mode) {
 int trust_is_at_least(TrustLevel actual, TrustLevel required) {
   return (actual >= required);
 }
+
+

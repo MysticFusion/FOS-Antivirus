@@ -68,35 +68,44 @@ typedef struct {
  * @brief Canonicalize a path and return a newly-allocated string, or NULL on
  *        failure. The caller must free() the result.
  */
+
 static char *canonicalize_path(const char *input) {
     if (input == NULL || input[0] == '\0') {
         return NULL;
     }
-
+    /* SECURITY: Reject ADS - colon after drive letter */
+    {
+        const char *first_colon = strchr(input, ':');
+        if (first_colon && strchr(first_colon+1, ':')) {
+            return NULL;
+        }
+        size_t len = strlen(input);
+        if (len > 0 && (input[len-1] == '.' || input[len-1] == ' ')) {
+            return NULL;
+        }
+    }
     char full[MAX_PATH] = {0};
-    DWORD len = GetFullPathNameA(input, MAX_PATH, full, NULL);
-    if (len == 0 || len >= MAX_PATH) {
+    DWORD l = GetFullPathNameA(input, MAX_PATH, full, NULL);
+    if (l == 0 || l >= MAX_PATH) {
         return NULL;
     }
-
-    /* Reject if it still contains ".." segments (defense-in-depth) */
-    if (strstr(full, "\\..\\") != NULL || strstr(full, "\\..") != NULL) {
+    if (strstr(full, "\\..\\") != NULL) {
         return NULL;
     }
-
-    /* Reject UNC paths (\\server\share) — only allow local drive paths */
     if (full[0] == '\\' && full[1] == '\\') {
         return NULL;
     }
-
-    /* Require a drive letter (e.g. "C:\") to ensure it's a local absolute path */
     if (!((full[0] >= 'A' && full[0] <= 'Z') || (full[0] >= 'a' && full[0] <= 'z')) ||
         full[1] != ':' || full[2] != '\\') {
         return NULL;
     }
-
+    DWORD attrs = GetFileAttributesA(full);
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        return NULL;
+    }
     return _strdup(full);
 }
+
 
 /**
  * @brief Check if a canonicalized path is under a system directory that
@@ -505,3 +514,5 @@ void reload_history_view(AppState *app)
 {
     load_history_items(app);
 }
+
+

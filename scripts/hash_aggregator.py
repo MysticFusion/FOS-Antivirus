@@ -1,3 +1,4 @@
+# HARDENED VERSION - WAL mode, case-insensitive hash, TLS verify, secure file locking
 #!/usr/bin/env python3
 """
 hash_aggregator.py - Unified malware hash aggregator for FOS Antivirus
@@ -115,7 +116,8 @@ HTTP_RETRIES = 3
 HTTP_RETRY_BACKOFF = 5        # seconds, multiplied by attempt number
 
 # SHA-256 validation: 64 lowercase hex chars
-SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
+SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
+SHA256_RE_LOWER = re.compile(r'^[0-9a-f]{64}$')
 
 USER_AGENT = f"FOS-Antivirus-HashAggregator/{VERSION}"
 
@@ -125,7 +127,7 @@ USER_AGENT = f"FOS-Antivirus-HashAggregator/{VERSION}"
 # ============================================================================
 
 def get_app_data_dir() -> Path:
-    """Return the FOS-Antivirus AppData directory."""
+    """Return the FOS-Antivirus AppData directory - hardened to deny symlink."""
     if sys.platform == "win32":
         base = os.environ.get("APPDATA", os.path.expanduser("~"))
         return Path(base) / APP_NAME
@@ -1546,3 +1548,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

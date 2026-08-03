@@ -799,3 +799,5 @@ int update_signature_db(const char *db_path) {
     ReleaseSRWLockExclusive(&g_update_lock);
     return result;
 }
+
+

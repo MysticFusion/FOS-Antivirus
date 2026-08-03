@@ -302,3 +302,5 @@ GList *scan_persistence_get_target_files(void) {
 
     return list;
 }
+
+
