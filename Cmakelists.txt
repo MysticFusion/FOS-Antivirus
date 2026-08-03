@@ -27,6 +27,7 @@ set(UTIL_SOURCES
 )
 
 set(ENGINE_SOURCES
+    src/engine/db_hmac.c
     src/engine/ed25519_verify.c
     src/engine/feature_extract.c
     src/engine/fs_enumerator.c
@@ -120,8 +121,16 @@ add_custom_command(TARGET FOS-Antivirus POST_BUILD
 # Optional: Add standard compiler flags for warnings
 if(MSVC)
     target_compile_options(FOS-Antivirus PRIVATE /W3 /WX-)
+    # I-05: exploit mitigations
+    target_compile_options(FOS-Antivirus PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA)
 else()
-    target_compile_options(FOS-Antivirus PRIVATE -Wall -Wextra)
+    target_compile_options(FOS-Antivirus PRIVATE -Wall -Wextra -fstack-protector-strong)
+    # I-05: exploit mitigations (ASLR, DEP, entropy) via linker flags
+    target_link_options(FOS-Antivirus PRIVATE
+        -Wl,--dynamicbase
+        -Wl,--nxcompat
+        -Wl,--high-entropy-va
+    )
 endif()
 
 if(BUILD_TESTING)
@@ -185,6 +194,32 @@ if(BUILD_TESTING)
     )
     target_include_directories(security_test_model_signature PRIVATE ${TEST_INCLUDE_DIRS})
     add_test(NAME security_test_model_signature COMMAND security_test_model_signature)
+
+    # Real-file ML score regression through the full C pipeline
+    # (gracefully skips when the system sample files are absent)
+    add_executable(security_test_ml_scores
+        tests/security/test_ml_scores.c
+        ${UNITY_SOURCES}
+        src/engine/ed25519_verify.c
+        src/engine/ml_engine.c
+        src/engine/feature_extract.c
+        src/utils/path_utils.c
+    )
+    target_include_directories(security_test_ml_scores PRIVATE ${TEST_INCLUDE_DIRS})
+    add_test(NAME security_test_ml_scores
+        COMMAND security_test_ml_scores
+                "${CMAKE_SOURCE_DIR}/assets/models/forest.bin")
+
+    # HMAC-SHA256 signature DB integrity (I-22/R-09)
+    add_executable(security_test_db_tamper
+        tests/security/test_db_tamper.c
+        ${UNITY_SOURCES}
+        src/engine/db_hmac.c
+        src/engine/sha2.c
+        src/utils/path_utils.c
+    )
+    target_include_directories(security_test_db_tamper PRIVATE ${TEST_INCLUDE_DIRS})
+    add_test(NAME security_test_db_tamper COMMAND security_test_db_tamper)
 
     # AES-256-GCM quarantine round-trip against the real DPAPI vault
     add_executable(security_test_quarantine_crypto
