@@ -197,6 +197,7 @@ fail:
 
 void ml_engine_cleanup(void)
 {
+    InitOnceExecuteOnce(&g_lock_once, init_lock_cb, NULL, NULL);
     EnterCriticalSection(&g_forest_lock);
     if (!g_forest) { LeaveCriticalSection(&g_forest_lock); return; }
     for (uint32_t i=0;i<g_forest->num_trees;i++) free(g_forest->trees[i].nodes);
@@ -207,6 +208,11 @@ void ml_engine_cleanup(void)
 
 double ml_engine_scan(const FileFeatures *features)
 {
+    /* Self-initialize the lock: scan_core calls ml_engine_scan directly and
+     * must not depend on a prior ml_engine_init()/ml_engine_pre_init() call
+     * (the standalone test harness never calls them). InitOnce is one-time
+     * and idempotent, so this is free on steady-state scans. */
+    InitOnceExecuteOnce(&g_lock_once, init_lock_cb, NULL, NULL);
     if (!g_forest && g_init_event) WaitForSingleObject(g_init_event, 1000);
     EnterCriticalSection(&g_forest_lock);
     BinaryForest *forest = g_forest;

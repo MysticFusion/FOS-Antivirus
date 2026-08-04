@@ -280,7 +280,8 @@ if(BUILD_TESTING)
         COMMAND security_test_script_pin
                 "$<TARGET_FILE_DIR:FOS-Antivirus>/scripts/hash_aggregator.py")
 
-    # HMAC-SHA256 signature DB integrity (I-22/R-09)
+    # HMAC-SHA256 signature DB integrity (I-22/R-09); DPAPI-derived key
+    # (MAP-04) needs crypt32.
     add_executable(security_test_db_tamper
         tests/security/test_db_tamper.c
         ${UNITY_SOURCES}
@@ -289,6 +290,7 @@ if(BUILD_TESTING)
         src/utils/path_utils.c
     )
     target_include_directories(security_test_db_tamper PRIVATE ${TEST_INCLUDE_DIRS})
+    target_link_libraries(security_test_db_tamper PRIVATE crypt32)
     add_test(NAME security_test_db_tamper COMMAND security_test_db_tamper)
 
     # AES-256-GCM quarantine round-trip against the real DPAPI vault
@@ -317,4 +319,58 @@ if(BUILD_TESTING)
         crypt32
     )
     add_test(NAME security_test_quarantine_crypto COMMAND security_test_quarantine_crypto)
+
+    # MAP-01/09/11 end-to-end regression: a scan dispatched with NO signature
+    # DB must still enumerate files (files_scanned > 0), return SCANCORE_OK,
+    # and expose db_available == false (the UI's "heuristic-only" banner);
+    # text DB "hash <label>" lines must preserve attribution.
+    add_executable(security_test_scan_nodb
+        tests/security/test_scan_nodb.c
+        ${UNITY_SOURCES}
+        src/app/app_paths.c
+        src/engine/db_hmac.c
+        src/engine/ed25519_verify.c
+        src/engine/feature_extract.c
+        src/engine/fs_enumerator.c
+        src/engine/hash_util.c
+        src/engine/heuristic_engine.c
+        src/engine/ml_engine.c
+        src/engine/response_engine.c
+        src/engine/scan_core.c
+        src/engine/scan_executor.c
+        src/engine/scan_persistence.c
+        src/engine/scan_processes.c
+        src/engine/scan_progress.c
+        src/engine/scan_report_bridge.c
+        src/engine/script_verify.c
+        src/engine/sha2.c
+        src/engine/signature_scan.c
+        src/engine/signature_scan_sqlite.c
+        src/engine/trust.c
+        src/ui/ui_scan_paths.c
+        src/utils/path_utils.c
+    )
+    target_include_directories(security_test_scan_nodb PRIVATE
+        ${TEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/src/app
+        ${CMAKE_SOURCE_DIR}/src/ui
+        ${CMAKE_BINARY_DIR}/generated   # aggregator_hash.h (script pin)
+    )
+    target_link_libraries(security_test_scan_nodb PRIVATE
+        PkgConfig::GTK
+        SQLite3::SQLite3
+        shlwapi
+        urlmon
+        wintrust
+        shell32
+        ole32
+        oleaut32
+        uuid
+        advapi32
+        wininet
+        psapi
+        bcrypt
+        crypt32
+    )
+    add_test(NAME security_test_scan_nodb COMMAND security_test_scan_nodb)
 endif()

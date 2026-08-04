@@ -9,6 +9,7 @@
 #include "hash_util.h"
 #include "db_hmac.h"
 #include "script_verify.h"   /* I-19: SHA-256 pin check for hash_aggregator.py */
+#include "path_utils.h"      /* FOS_MAX_PATH (MAP-12: wide command line) */
 
 #include <errno.h>
 #include <stdarg.h>
@@ -18,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <wchar.h>
 #include <windows.h>
 #include <shlwapi.h>
 #include <shellapi.h>
@@ -292,7 +294,9 @@ static int load_signature_file_unlocked(const char *sigdb_path) {
         return 0;
     }
 
-    /* Fall back to text file format (one sha256 per line) */
+    /* Fall back to text file format (one sha256 per line, optionally
+     * "hash <label>"). MAP-11: labels are preserved per entry instead of
+     * collapsing everything to a generic label. */
     FILE *f = fopen(sigdb_path, "r");
     if (f == NULL) return -1;
     SigHashTable *new_table = sig_hash_table_init(HASH_TABLE_SIZE);
@@ -301,10 +305,30 @@ static int load_signature_file_unlocked(const char *sigdb_path) {
     while (fgets(line, sizeof(line), f)) {
         line[strcspn(line, "\r\n")] = '\0';
         if (line[0] == '\0' || line[0] == '#') continue;
+
+        /* Bounded copy of the first 64 chars guarantees hex_string_to_bytes
+         * never reads past the end of a short line. */
+        char hash_hex[SHA256_SIZE * 2 + 1];
+        strncpy_s(hash_hex, sizeof(hash_hex), line, SHA256_SIZE * 2);
+        hash_hex[SHA256_SIZE * 2] = '\0';
+
         unsigned char hash[SHA256_SIZE];
-        if (hex_string_to_bytes(line, hash) == 0) {
-            sig_hash_table_add(new_table, hash, GENERIC_THREAT_LABEL);
+        if (hex_string_to_bytes(hash_hex, hash) != 0) continue;
+
+        /* MAP-11: parse an optional "hash <label>" attribution. Everything
+         * after the first space/tab (leading whitespace trimmed) becomes the
+         * label, up to the hash-table's 128-char limit. */
+        const char *label = GENERIC_THREAT_LABEL;
+        char label_buf[129] = {0};
+        if (line[SHA256_SIZE * 2] == ' ' || line[SHA256_SIZE * 2] == '\t') {
+            const char *rest = line + SHA256_SIZE * 2;
+            while (*rest == ' ' || *rest == '\t') rest++;
+            if (*rest != '\0' && strlen(rest) <= 128) {
+                strncpy_s(label_buf, sizeof(label_buf), rest, _TRUNCATE);
+                label = label_buf;
+            }
         }
+        sig_hash_table_add(new_table, hash, label);
     }
     fclose(f);
     free_signature_table_unlocked();
@@ -675,7 +699,6 @@ int update_signature_db(const char *db_path) {
 
     char python_path[MAX_PATH] = {0};
     char script_path[MAX_PATH] = {0};
-    char cmdline[3 * MAX_PATH] = {0};
     int result = -1;
 
     update_progress = 0;
@@ -708,11 +731,31 @@ int update_signature_db(const char *db_path) {
         return -1;
     }
 
-    /* 4. Build command line: python.exe "<script>" --db "<db_path>" update.
-     *    All paths are quoted in case of spaces (e.g. "C:\Program Files\..."). */
-    snprintf(cmdline, sizeof(cmdline),
-             "\"%s\" \"%s\" --db \"%s\" update",
-             python_path, script_path, db_path);
+    /* 4. MAP-12: build the command line with CreateProcess quoting rules.
+     *    Every path is wrapped in double quotes ("C:\Program Files\..." etc.).
+     *    No shell is involved (no system()/ShellExecuteExA — a security
+     *    product must never route its update through a shell). */
+    wchar_t python_w[FOS_MAX_PATH], script_w[FOS_MAX_PATH], db_w[FOS_MAX_PATH];
+    wchar_t cmdline_w[FOS_MAX_PATH * 4];
+    if (MultiByteToWideChar(CP_UTF8, 0, python_path, -1,
+                            python_w, FOS_MAX_PATH) <= 0 ||
+        MultiByteToWideChar(CP_UTF8, 0, script_path, -1,
+                            script_w, FOS_MAX_PATH) <= 0 ||
+        MultiByteToWideChar(CP_UTF8, 0, db_path, -1,
+                            db_w, FOS_MAX_PATH) <= 0) {
+        update_error_code = UPDATE_ERR_PYTHON_FAILED;
+        update_progress = -1;
+        ReleaseSRWLockExclusive(&g_update_lock);
+        return -1;
+    }
+    if (_snwprintf_s(cmdline_w, FOS_MAX_PATH * 4, _TRUNCATE,
+                     L"\"%s\" \"%s\" --db \"%s\" update",
+                     script_w, db_w) < 0) {
+        update_error_code = UPDATE_ERR_PYTHON_FAILED;
+        update_progress = -1;
+        ReleaseSRWLockExclusive(&g_update_lock);
+        return -1;
+    }
 
     /* 5. Set up stdout pipe so we can read JSONL progress */
     SECURITY_ATTRIBUTES sa = {sizeof(SECURITY_ATTRIBUTES), NULL, TRUE};
@@ -726,8 +769,13 @@ int update_signature_db(const char *db_path) {
     /* Ensure the read handle is NOT inherited */
     SetHandleInformation(hChildStdoutRead, HANDLE_FLAG_INHERIT, 0);
 
-    /* 6. Launch the Python process */
-    STARTUPINFOA si = {0};
+    /* 6. Launch the Python process.
+     *    MAP-12: CreateProcessW with lpApplicationName set explicitly to the
+     *    resolved python.exe absolute path (never NULL-with-cmdline) and the
+     *    script path quoted per CreateProcess quoting rules. This closes the
+     *    argument-injection surface on paths containing spaces or special
+     *    characters. */
+    STARTUPINFOW si = {0};
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = hChildStdoutWrite;
@@ -736,9 +784,9 @@ int update_signature_db(const char *db_path) {
 
     PROCESS_INFORMATION pi = {0};
 
-    BOOL launched = CreateProcessA(
-        NULL,          /* lpApplicationName (NULL = use cmdline) */
-        cmdline,       /* lpcmdline (must be mutable) */
+    BOOL launched = CreateProcessW(
+        python_w,      /* lpApplicationName: resolved python.exe absolute path */
+        cmdline_w,     /* lpCommandLine: quoted script + args (mutable)       */
         NULL,          /* lpProcessAttributes */
         NULL,          /* lpThreadAttributes */
         TRUE,          /* bInheritHandles */

@@ -120,7 +120,9 @@ FYP-2_Report.pdf
 
 # Local work docs & artifacts (never commit -- repo is public)
 MAP_work_stats.md
+MAP_work_status.md
 Master_Action_Plan(MAP).md
+Master_Action_Plan(MAP) v2.md
 project_structure_&_code.txt
 export_project.py
 FOS-Antivirus-Hardened-Patch.zip

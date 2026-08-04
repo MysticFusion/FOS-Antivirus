@@ -102,7 +102,7 @@ TrustLevel trust_evaluate_path(const char *path, bool quick_mode) {
   WCHAR w_path[MAX_PATH];
   MultiByteToWideChar(CP_UTF8, 0, path, -1, w_path, MAX_PATH);
 
-  PWSTR prog_path = NULL, prog86_path = NULL, data_path = NULL;
+  PWSTR prog_path = NULL, prog86_path = NULL;
   TrustLevel result = TRUST_NONE;
 
   /* 1. Digital Signature Verification */
@@ -111,8 +111,13 @@ TrustLevel trust_evaluate_path(const char *path, bool quick_mode) {
     return is_microsoft ? TRUST_HIGH : TRUST_PARTIAL;
   }
 
-  /* 2. Application Directories (Partial Trust)
-   * Only reached if signature verification failed (unsigned or invalid). */
+  /* 2. Application Directories (Partial Trust) — SIGNATURE-REQUIRED.
+   * MAP-05: only reached if signature verification FAILED (unsigned or
+   * invalid Authenticode). Location alone never grants trust. Restrict
+   * the location heuristic to Program Files (tight ACLs); FOLDERID_ProgramData
+   * is world-writable (any interactive user can create subdirectories), so an
+   * unsigned binary dropped at C:\ProgramData\evil\evil.exe stays TRUST_NONE
+   * and receives NO heuristic dampening. */
   if (SUCCEEDED(
           SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, NULL, &prog_path))) {
     if (path_starts_with_w(w_path, prog_path))
@@ -125,13 +130,6 @@ TrustLevel trust_evaluate_path(const char *path, bool quick_mode) {
     if (path_starts_with_w(w_path, prog86_path))
       result = TRUST_PARTIAL;
     CoTaskMemFree(prog86_path);
-  }
-  if (result == TRUST_NONE &&
-      SUCCEEDED(
-          SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, NULL, &data_path))) {
-    if (path_starts_with_w(w_path, data_path))
-      result = TRUST_PARTIAL;
-    CoTaskMemFree(data_path);
   }
 
   return result;

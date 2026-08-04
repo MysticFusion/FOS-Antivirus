@@ -29,8 +29,19 @@
 #define QUEUE_BACKPRESSURE_LMT 64
 #define QUICK_SCAN_MAX_FILE_AGE_DAYS 30
 #define MAX_PATH_LEN 260
+#define HEUR_DOUBLE_EXT_SCORE 15 /* MAP-10: invoice.pdf.exe social engineering */
 
 typedef struct { char *path; ScanReason reason; bool quick_mode; } ScanTask;
+
+/* MAP-08: explicit filter options for the directory-walk callback. The old
+ * code reused a `bool` named `quick_mode` at the call site and
+ * `skip_old` semantics in the callback, which was a latent correctness
+ * hazard (any "rename to match" commit would invert the age filter). */
+typedef struct {
+    bool apply_age_filter; /* true  -> skip files older than max_age_days
+                            *         (persistence paths are always exempt) */
+    int  max_age_days;     /* age threshold in days, when the filter is on  */
+} WalkFilter;
 
 static GThreadPool *g_scan_pool = NULL;
 static GMutex g_scan_pool_mutex;
@@ -66,8 +77,44 @@ static bool is_file_older_than_days(const char *path, int days)
 static bool is_persistence_path(const char *path)
 {
     if (!path) return false;
-    char lower[MAX_PATH]; strncpy_s(lower, sizeof(lower), path, _TRUNCATE); _strlwr_s(lower, sizeof(lower));
-    return strstr(lower, "\\startup\\") || strstr(lower, "\\downloads\\") || strstr(lower, "start menu\\programs\\startup");
+    /* MAP-07: wide-char search so paths > MAX_PATH (260) are not truncated
+     * away before the persistence markers are located. */
+    wchar_t wide[FOS_MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, FOS_MAX_PATH) <= 0) return false;
+    return StrStrIW(wide, L"\\startup\\") != NULL ||
+           StrStrIW(wide, L"\\downloads\\") != NULL ||
+           StrStrIW(wide, L"start menu\\programs\\startup") != NULL;
+}
+
+/* MAP-10: detect the classic social-engineering double extension
+ * ("invoice.pdf.exe"). Returns true when the terminal extension is preceded
+ * by a document-type extension (pdf/docx/xlsx/jpg/txt/...). */
+static bool has_suspicious_double_ext(const char *path)
+{
+    if (!path) return false;
+    const char *last = PathFindExtensionA(path);
+    if (!last || *last == '\0') return false;
+
+    /* Walk backwards from the terminal extension to the previous '.'. */
+    const char *p = last - 1;
+    while (p > path && *p != '.') p--;
+    if (*p != '.') return false;           /* single extension only */
+    if (p == path) return false;
+
+    size_t inner_len = (size_t)(last - p); /* includes the leading '.' */
+    if (inner_len >= 16) return false;
+
+    static const char *k_doc_exts[] = {
+        ".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt",
+        ".jpg", ".jpeg", ".png", ".gif", ".txt", ".rtf", ".csv", NULL
+    };
+    char inner[16];
+    strncpy_s(inner, sizeof(inner), p, _TRUNCATE);
+    _strlwr_s(inner, sizeof(inner));
+    for (int i = 0; k_doc_exts[i] != NULL; i++) {
+        if (strcmp(inner, k_doc_exts[i]) == 0) return true;
+    }
+    return false;
 }
 
 static bool is_extension_allowed(const char *path)
@@ -159,6 +206,23 @@ static void scan_single_file_internal(const char *path, ScanReason reason, bool 
         if (trust == TRUST_NONE) ml_score = ml_engine_scan(&input->features);
     }
 
+    /* MAP-10: double-extension files (invoice.pdf.exe) get an additive
+     * risk score; re-derive the verdict against the same thresholds used
+     * by the heuristic engine. */
+    if (has_suspicious_double_ext(path)) {
+        heur.score += HEUR_DOUBLE_EXT_SCORE;
+        if (heur.score >= 90) {
+            heur.verdict = VERDICT_MALICIOUS;
+        } else if (heur.score >= 45) {
+            heur.verdict = VERDICT_SUSPICIOUS;
+        }
+        size_t used = strlen(heur.explanation);
+        if (used < sizeof(heur.explanation) - 1) {
+            strncat(heur.explanation, " Double-extension;",
+                    sizeof(heur.explanation) - used - 1);
+        }
+    }
+
     g_mutex_lock(&global_scan_ctx.mutex);
     global_scan_ctx.files_scanned++;
     g_mutex_unlock(&global_scan_ctx.mutex);
@@ -216,12 +280,32 @@ static int enqueue_scan_task(const char *path, ScanReason reason, bool quick_mod
 static void scan_walk_callback(const char *file_path, void *user_data)
 {
     if (!file_path || !user_data) return;
-    bool quick_mode = *(bool*)user_data;
-    // Apply filters
-    if (quick_mode) {
-        if (!is_persistence_path(file_path) && is_file_older_than_days(file_path, QUICK_SCAN_MAX_FILE_AGE_DAYS)) return;
+    /* MAP-08: explicit WalkFilter semantics, no more bool-overloading. */
+    WalkFilter *filter = (WalkFilter*)user_data;
+    /* Apply filters: the age filter is opt-in per walk root, and
+     * persistence paths (Startup/Downloads) are always exempt because
+     * persistence is time-independent. */
+    if (filter->apply_age_filter) {
+        if (!is_persistence_path(file_path) &&
+            is_file_older_than_days(file_path, filter->max_age_days)) return;
     }
-    enqueue_scan_task(file_path, SCAN_REASON_MANUAL, quick_mode);
+    enqueue_scan_task(file_path, SCAN_REASON_MANUAL, filter->apply_age_filter);
+}
+
+/* MAP-01/MAP-09: advisory signature-DB availability flag. */
+void scan_core_set_db_available(bool ok)
+{
+    g_mutex_lock(&global_scan_ctx.mutex);
+    global_scan_ctx.db_available = ok;
+    g_mutex_unlock(&global_scan_ctx.mutex);
+}
+
+bool scan_core_db_available(void)
+{
+    g_mutex_lock(&global_scan_ctx.mutex);
+    bool ok = global_scan_ctx.db_available;
+    g_mutex_unlock(&global_scan_ctx.mutex);
+    return ok;
 }
 
 int scan_core_start_scan(const char *sigdb_path, const char *path_to_scan,
@@ -229,15 +313,27 @@ int scan_core_start_scan(const char *sigdb_path, const char *path_to_scan,
 {
     (void)low_priority;
     if (!sigdb_path || !path_to_scan) return SCANCORE_FILE_ERR;
-    if (signature_db_load(sigdb_path)!=0) return SCANCORE_FILE_ERR;
+
+    /* MAP-01: ALWAYS start progress FIRST, before any DB work, so the
+     * progress subsystem can never report "not running" while a scan is
+     * actually being dispatched. */
     scan_progress_start(0);
+
+    /* MAP-01/MAP-09: the signature DB load is advisory. A missing or
+     * invalid DB disables only the signature layer; enumeration, heuristic
+     * and ML analysis still run and the UI surfaces a warning. */
+    bool db_ok = (signature_db_load(sigdb_path) == 0);
+
     g_mutex_lock(&global_scan_ctx.mutex);
     global_scan_ctx.stop_requested=false;
     global_scan_ctx.is_running=true;
+    global_scan_ctx.db_available=db_ok;
     g_mutex_unlock(&global_scan_ctx.mutex);
 
-    bool qm = quick_mode;
-    list_files_recursive(path_to_scan, scan_walk_callback, &qm);
+    WalkFilter wf;
+    wf.apply_age_filter = quick_mode;
+    wf.max_age_days     = QUICK_SCAN_MAX_FILE_AGE_DAYS;
+    list_files_recursive(path_to_scan, scan_walk_callback, &wf);
 
     while (InterlockedCompareExchange(&g_pending_tasks, 0, 0) > 0) {
         Sleep(20);
@@ -255,10 +351,15 @@ int scan_core_start_scan(const char *sigdb_path, const char *path_to_scan,
 
 int scan_core_quick_scan(const char *sigdb_path)
 {
-    if (signature_db_load(sigdb_path)!=0) return SCANCORE_FILE_ERR;
+    if (!sigdb_path) return SCANCORE_FILE_ERR;
+
+    /* MAP-01: progress first; DB load advisory (see scan_core_start_scan). */
     scan_progress_start(0);
+    bool db_ok = (signature_db_load(sigdb_path) == 0);
+
     g_mutex_lock(&global_scan_ctx.mutex);
     global_scan_ctx.stop_requested=false; global_scan_ctx.is_running=true;
+    global_scan_ctx.db_available=db_ok;
     g_mutex_unlock(&global_scan_ctx.mutex);
 
     GList *proc = scan_processes_get_loaded_images();
@@ -276,9 +377,14 @@ int scan_core_quick_scan(const char *sigdb_path)
     GList *quick_paths = get_quick_scan_paths();
     for (GList *l=quick_paths; l; l=l->next) {
         if (!l->data) continue;
-        bool skip_old = !is_persistence_path((char*)l->data);
+        /* MAP-08: explicit WalkFilter. Persistence roots (Startup,
+         * Downloads) are exempt from the age filter; everything else
+         * skips files older than 30 days. */
+        WalkFilter wf;
+        wf.apply_age_filter = !is_persistence_path((char*)l->data);
+        wf.max_age_days     = QUICK_SCAN_MAX_FILE_AGE_DAYS;
         // Walk each path
-        list_files_recursive((char*)l->data, scan_walk_callback, &skip_old);
+        list_files_recursive((char*)l->data, scan_walk_callback, &wf);
     }
     if (quick_paths) g_list_free_full(quick_paths, g_free);
 
@@ -300,7 +406,10 @@ int scan_core_scan_file(const char *sigdb_path, const char *file_path, ScanReaso
 {
     (void)sigdb_path;
     if (!file_path) return SCANCORE_FILE_ERR;
-    if (signature_db_load(sigdb_path)!=0) return SCANCORE_FILE_ERR;
+    /* Advisory (MAP-01/09): single-file scans proceed in heuristic-only
+     * mode when the DB is absent; the RT monitor never silently drops a
+     * file because definitions are missing. */
+    scan_core_set_db_available(signature_db_load(sigdb_path) == 0);
     return enqueue_scan_task(file_path, reason, false);
 }
 
@@ -308,7 +417,7 @@ int scan_core_scan_file_wide(const char *sigdb_path, const wchar_t *file_path, S
 {
     (void)sigdb_path;
     if (!file_path) return SCANCORE_FILE_ERR;
-    if (signature_db_load(sigdb_path)!=0) return SCANCORE_FILE_ERR;
+    scan_core_set_db_available(signature_db_load(sigdb_path) == 0); /* advisory */
 
     /* Wide -> UTF-8 once (the scan pipeline is char-based up to the per-file
      * fos_path_t conversion). Uses a full FOS_MAX_PATH buffer so deep paths

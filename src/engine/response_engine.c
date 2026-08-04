@@ -546,7 +546,14 @@ static int secure_delete(const fos_path_t *src)
             DWORD chunk = (remaining.QuadPart > (LONGLONG)sizeof(buffer))
                               ? (DWORD)sizeof(buffer) : (DWORD)remaining.QuadPart;
             if (random) {
-                BCryptGenRandom(NULL, buffer, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+                /* MAP-03: fail-closed. If entropy generation fails, abort
+                 * the wipe and surface an error — never overwrite with a
+                 * predictable pattern and pretend it was secure. */
+                if (BCryptGenRandom(NULL, buffer, chunk,
+                                    BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+                    CloseHandle(h);
+                    return -1; /* original file is left in place */
+                }
             } else {
                 memcpy(buffer, zeros, chunk);
             }
@@ -673,8 +680,17 @@ int response_quarantine_file(const char *src_path, const char *threat_label)
     memcpy(meta_plain + sizeof(meta_hdr) + path_len, threat_label, label_len);
 
     uint8_t nonce_meta[Q_NONCE_LEN], nonce_body[Q_NONCE_LEN];
-    BCryptGenRandom(NULL, nonce_meta, sizeof(nonce_meta), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    BCryptGenRandom(NULL, nonce_body, sizeof(nonce_body), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    /* MAP-03: fail-closed. A nonce is a one-time secret; if the CSPRNG
+     * fails we MUST NOT fall back to weak entropy — refuse to quarantine. */
+    if (BCryptGenRandom(NULL, nonce_meta, sizeof(nonce_meta),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0 ||
+        BCryptGenRandom(NULL, nonce_body, sizeof(nonce_body),
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        CloseHandle(fin);
+        CloseHandle(fout);
+        DeleteFileW(fos_path_w(&dst));
+        return RESP_ERR_KEY;
+    }
 
     /* AAD binds the header to the ciphertexts. */
     uint8_t aad[8];

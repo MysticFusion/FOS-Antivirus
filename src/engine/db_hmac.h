@@ -2,11 +2,14 @@
  * @file db_hmac.h
  * @brief HMAC-SHA256 integrity protection for the signature database (I-22/R-09).
  *
- * The signature database is authenticated with a keyed HMAC-SHA256 using a
- * key embedded in the binary. The HMAC file lives next to the database as
- * "<db>.hmac" (32 raw bytes). Loaders refuse databases whose HMAC is missing
- * or mismatched, so tampering with the database is detected even when the
- * database itself sits in a user-writable location.
+ * The signature database is authenticated with a keyed HMAC-SHA256. The
+ * 32-byte key is derived at runtime from a DPAPI-protected blob
+ * (CryptProtectData, machine-bound — MAP-04) and cached in memory; it is
+ * never embedded in the binary. The HMAC file lives next to the database
+ * as "<db>.hmac" (32 raw bytes). Loaders refuse databases whose HMAC is
+ * missing or mismatched (and refuse to run at all if DPAPI is unavailable),
+ * so tampering with the database is detected even when the database itself
+ * sits in a user-writable location.
  */
 
 #ifndef DB_HMAC_H

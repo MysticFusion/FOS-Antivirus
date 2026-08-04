@@ -73,6 +73,12 @@ typedef struct {
     bool is_running;
     bool stop_requested;
 
+    /* MAP-01/MAP-09: signature-DB availability is ADVISORY, not fatal.
+     * Enumeration and per-file analysis always run; when false, the
+     * signature layer is bypassed and the UI surfaces a heuristic-only
+     * warning instead of aborting the scan. */
+    bool db_available;
+
     /* Progress Tracking */
     int  files_scanned;
     int  threats_found;
@@ -81,6 +87,23 @@ typedef struct {
 } ScanContext;
 
 extern ScanContext global_scan_ctx;
+
+/* ============================================================================
+ * Advisory Signature-DB Availability (MAP-01 / MAP-09)
+ * ========================================================================== */
+
+/**
+ * @brief Record whether the signature database could be loaded for the
+ *        current scan session. Never fatal: a missing/invalid DB only
+ *        disables the signature layer, not enumeration/heuristics/ML.
+ */
+void scan_core_set_db_available(bool ok);
+
+/**
+ * @brief Read the advisory DB-availability flag for the current scan.
+ * @return true if the signature database is loaded and usable.
+ */
+bool scan_core_db_available(void);
 
 /* ============================================================================
  * Public Functions

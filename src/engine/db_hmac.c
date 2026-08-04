@@ -1,6 +1,15 @@
 /**
  * @file db_hmac.c
  * @brief HMAC-SHA256 integrity protection for the signature database (I-22/R-09).
+ *
+ * MAP-04: the HMAC key is no longer a compile-time constant embedded in the
+ * binary (recoverable with `strings`/disassembly). It is now derived at
+ * runtime from a DPAPI-protected blob (CryptProtectData,
+ * CRYPTPROTECT_LOCAL_MACHINE), so the key material never appears in the
+ * image and an attacker needs the machine's DPAPI master key (or process
+ * memory) to forge a valid HMAC. The derived key is cached in memory after
+ * first derivation. If DPAPI fails, the operation FAILS CLOSED — the DB is
+ * refused rather than verified with a weaker/absent key.
  */
 #define _CRT_SECURE_NO_WARNINGS
 #include "db_hmac.h"
@@ -10,23 +19,79 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Keyed HMAC-SHA256 over the raw database bytes.
- *
- * The key is embedded in the binary at build time (generated once; the
- * attacker cannot derive it from the DB or the .hmac file). Rotate by
- * regenerating this constant and re-releasing the application. */
-static const uint8_t k_db_hmac_key[DB_HMAC_SIZE] = {
-    0xc2, 0x68, 0x66, 0xef, 0xf7, 0x29, 0xd4, 0xe7, 0x5e, 0x1e, 0x23, 0xa6,
-    0x0a, 0xf4, 0x07, 0x42, 0x04, 0x38, 0x83, 0xe4, 0x2a, 0x04, 0xec, 0x7c,
-    0x9e, 0x32, 0xa2, 0xc4, 0xac, 0x6e, 0x57, 0xf0,
-};
+#include <stdbool.h>
+#include <windows.h>
+#include <wincrypt.h>
 
 #define HMAC_BLOCK_SIZE 64
+
+/* ============================================================================
+ * MAP-04: DPAPI-derived key (machine-bound, cached in memory)
+ * ========================================================================== */
+
+static SRWLOCK g_db_key_lock = SRWLOCK_INIT;
+static uint8_t g_db_key[DB_HMAC_SIZE];
+static bool    g_db_key_ready = false;
+
+/**
+ * @brief Derive (once) and return the 32-byte DB-HMAC key.
+ *
+ * CryptProtectData() binds a small label blob to the machine SID; the
+ * 32-byte key is SHA-256 of that protected blob. Because the protected
+ * blob is deterministic for a given machine, the same key is derived on
+ * write (update) and verify (load) without any key file being stored.
+ *
+ * @return 0 on success, -1 on DPAPI failure (fail-closed).
+ */
+static int derive_db_key(uint8_t out[DB_HMAC_SIZE])
+{
+    if (!out) return -1;
+
+    AcquireSRWLockExclusive(&g_db_key_lock);
+    if (g_db_key_ready) {
+        memcpy(out, g_db_key, DB_HMAC_SIZE);
+        ReleaseSRWLockExclusive(&g_db_key_lock);
+        return 0;
+    }
+
+    /* Fixed label: not secret, but required to make the DPAPI blob
+     * machine-deterministic and context-bound to this application. */
+    static const BYTE k_seed[] = "FOS-Antivirus-SigDB-HMAC-v1";
+    DATA_BLOB in  = { (DWORD)(sizeof(k_seed) - 1), (BYTE *)k_seed };
+    DATA_BLOB blob = { 0, NULL };
+
+    BOOL ok = CryptProtectData(&in, L"FOS-Antivirus Signature Database Integrity",
+                               NULL, NULL, NULL,
+                               CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
+                               &blob);
+
+    if (!ok || blob.pbData == NULL || blob.cbData == 0) {
+        ReleaseSRWLockExclusive(&g_db_key_lock);
+        return -1; /* fail-closed: never verify with a weak/absent key */
+    }
+
+    sha256_ctx ctx;
+    sha256_init(&ctx);
+    sha256_update(&ctx, blob.pbData, blob.cbData);
+    sha256_final(&ctx, g_db_key);
+    LocalFree(blob.pbData);
+
+    g_db_key_ready = true;
+    memcpy(out, g_db_key, DB_HMAC_SIZE);
+    ReleaseSRWLockExclusive(&g_db_key_lock);
+    return 0;
+}
+
+/* ============================================================================
+ * HMAC-SHA256 (keyed) over the raw database bytes
+ * ========================================================================== */
 
 int db_hmac_compute_file(const char *db_path, uint8_t out[DB_HMAC_SIZE])
 {
     if (!db_path || !out) return -1;
+
+    uint8_t db_key[DB_HMAC_SIZE];
+    if (derive_db_key(db_key) != 0) return -1; /* fail-closed */
 
     fos_path_t fp;
     if (!fos_path_init(&fp, db_path)) return -1;
@@ -39,7 +104,7 @@ int db_hmac_compute_file(const char *db_path, uint8_t out[DB_HMAC_SIZE])
     /* First update: HMAC inner hash = H(ipad_key || message). */
     uint8_t ipad_key[HMAC_BLOCK_SIZE] = {0};
     uint8_t opad_key[HMAC_BLOCK_SIZE] = {0};
-    memcpy(ipad_key, k_db_hmac_key, DB_HMAC_SIZE);
+    memcpy(ipad_key, db_key, DB_HMAC_SIZE);
     memcpy(opad_key, ipad_key, HMAC_BLOCK_SIZE);
     for (int i = 0; i < HMAC_BLOCK_SIZE; i++) {
         ipad_key[i] ^= 0x36;

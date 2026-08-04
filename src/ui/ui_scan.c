@@ -42,6 +42,37 @@ typedef struct {
 } ScanErrorData;
 
 /* ============================================================================
+ * MAP-01: Single authoritative terminal-state signal (SCAN STATE MACHINE)
+ *
+ * The old design let the 100 ms progress-tick poll the backend and GUESS
+ * whether the scan finished with results, zero files, or an error. Because
+ * the deferred error callback (g_idle_add) runs on the same main loop after
+ * the tick, the tick could win the race, render "Files Scanned: 0", and
+ * swallow the real error. The fix: the worker thread posts exactly ONE
+ * terminal message via g_idle_add(scan_terminal_cb) after all work is
+ * finalized; the tick only ever updates live telemetry and never decides
+ * terminal state.
+ * ========================================================================== */
+
+/** @brief Final outcome of a scan session (posted by the worker thread). */
+typedef enum {
+    SCAN_TERM_OK,          /**< Completed with >= 1 file scanned            */
+    SCAN_TERM_EMPTY,       /**< Completed, but no scannable files in target */
+    SCAN_TERM_ABORTED,     /**< User requested stop before completion       */
+    SCAN_TERM_ERR_NO_DB,   /**< Completed heuristic-only; DB unavailable    */
+    SCAN_TERM_ERR_GENERIC  /**< Fatal scan-core failure                     */
+} ScanTermStatus;
+
+/** @brief Payload for the authoritative terminal callback. */
+typedef struct {
+    AppState      *app;
+    ScanTermStatus status;
+    int            files;
+    int            threats;
+    char          *err;   /**< optional message, g_free'd by the callback */
+} ScanTermMsg;
+
+/* ============================================================================
  * Internal Prototypes
  * ========================================================================== */
 
@@ -49,6 +80,7 @@ static gpointer scan_worker_thread(gpointer user_data);
 static gpointer update_then_scan_worker(gpointer data);
 static gboolean start_scan_from_idle_cb(gpointer data);
 static gboolean on_scan_progress_tick(gpointer user_data);
+static gboolean scan_terminal_cb(gpointer user_data);
 static void     on_folder_selected(GObject *source_object, GAsyncResult *res, gpointer user_data);
 static void     on_stop_or_back_clicked(GtkButton *btn, gpointer user_data);
 static void     on_back_home(GtkButton *btn, gpointer user_data);
@@ -61,25 +93,38 @@ static gboolean show_scan_error_cb(gpointer user_data);
 
 /**
  * @brief GLib timeout callback: Syncs backend scan progress to the UI.
+ *
+ * MAP-01: this tick is LIVE-TELEMETRY ONLY. It updates the current-file
+ * label and pulses the bar while the scan runs. It NEVER decides terminal
+ * state (results / zero-files / error) — that is the exclusive job of
+ * scan_terminal_cb(), which the worker thread posts exactly once via
+ * g_idle_add() after all work is finalized. This eliminates the
+ * tick-vs-error-callback race that produced the "instant 0 files" bug.
  */
 static gboolean on_scan_progress_tick(gpointer user_data)
 {
     AppState *app = (AppState *)user_data;
     bool still_running = scan_progress_is_running();
-    int  scanned_count = scan_progress_files_scanned();
-    int  threat_count  = scan_progress_threats_found();
-    const char *current_file = scan_progress_current_file();
 
-    char label_buffer[512] = "Scanning...";
-
-    /* If an error was posted (signature DB missing), freeze the UI */
+    /* If an error was posted (e.g. the update-before-scan path failed),
+     * freeze the UI and stop this timer. This path does not post a
+     * ScanTermMsg, so the tick must handle it. */
     if (app->scan_error) {
-        /* Don't update label; keep the error message. Stop pulsing. */
         if (app->progress_bar)
             gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->progress_bar), 0.0);
         app->scan_view_active = FALSE;
         return G_SOURCE_REMOVE; /* stop this timer */
     }
+
+    /* Scan finished: the authoritative terminal callback (scan_terminal_cb)
+     * is already queued on the main loop and will render the final view.
+     * Stop the live telemetry timer. */
+    if (!still_running) {
+        return G_SOURCE_REMOVE;
+    }
+
+    const char *current_file = scan_progress_current_file();
+    char label_buffer[512] = "Scanning...";
 
     if (current_file != NULL && current_file[0] != '\0') {
         GError *error = NULL;
@@ -102,39 +147,69 @@ static gboolean on_scan_progress_tick(gpointer user_data)
     gtk_label_set_text(GTK_LABEL(app->progress_label), label_buffer);
     gtk_progress_bar_pulse(GTK_PROGRESS_BAR(app->progress_bar));
 
-    /* Check for completion */
-    if (!still_running) {
-        if (scanned_count > 0) {
-            gchar *f_txt = g_strdup_printf("Files Scanned: %d", scanned_count);
-            gchar *t_txt = g_strdup_printf("Threats Found: %d", threat_count);
+    return G_SOURCE_CONTINUE;
+}
 
-            gtk_label_set_text(GTK_LABEL(app->result_files_label), f_txt);
-            gtk_label_set_text(GTK_LABEL(app->result_threats_label), t_txt);
+/**
+ * @brief MAP-01: the single authoritative scan terminal callback.
+ *
+ * Runs on the GTK main loop and renders the FINAL scan view exactly once.
+ * Because it is posted by the worker thread after scan_progress_finish()
+ * (and after the error string is finalized), there is no race with the
+ * progress tick: the tick cannot declare "0 files complete" before this
+ * callback runs.
+ */
+static gboolean scan_terminal_cb(gpointer user_data)
+{
+    ScanTermMsg *m = (ScanTermMsg *)user_data;
+    AppState    *app = m->app;
 
-            g_free(f_txt);
-            g_free(t_txt);
-
-            reload_history_view(app);
-            app->scan_view_active = FALSE;
-            gtk_stack_set_visible_child_name(GTK_STACK(app->stack), "complete");
-            return G_SOURCE_REMOVE;
+    /* Advisory warning / fatal error: surface on the progress view (the
+     * visible "banner"), exactly like the legacy error path. The user
+     * dismisses via Cancel/Back. */
+    if (m->status == SCAN_TERM_ERR_NO_DB || m->status == SCAN_TERM_ERR_GENERIC) {
+        if (app->progress_label) {
+            gtk_label_set_text(GTK_LABEL(app->progress_label),
+                m->status == SCAN_TERM_ERR_NO_DB
+                    ? "Signature database not available - scan ran in "
+                      "heuristic-only mode. Run Update in Settings to enable "
+                      "signature detection."
+                    : (m->err ? m->err : "Scan failed unexpectedly."));
         }
-
-        /* Scan finished with zero files and no error posted yet —
-           either the error idle callback hasn't fired or it genuinely
-           finished with nothing to scan.  Give the error path a moment
-           to land; if scan_error is still false after a brief wait,
-           show a clean "no files" result. */
-        if (!app->scan_error) {
-            gtk_label_set_text(GTK_LABEL(app->result_files_label), "Files Scanned: 0");
-            gtk_label_set_text(GTK_LABEL(app->result_threats_label), "Threats Found: 0");
-            app->scan_view_active = FALSE;
-            gtk_stack_set_visible_child_name(GTK_STACK(app->stack), "complete");
-        }
+        if (app->progress_bar)
+            gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(app->progress_bar), 0.0);
+        app->scan_error = TRUE;
+        app->scan_view_active = FALSE;
+        g_free(m->err);
+        g_free(m);
         return G_SOURCE_REMOVE;
     }
 
-    return G_SOURCE_CONTINUE;
+    /* Success path (OK / EMPTY / ABORTED): render the complete view with
+     * the final, truthful counts. "0 files" is only shown when enumeration
+     * actually ran and found nothing — never because an error was pending. */
+    gchar *f_txt = g_strdup_printf("Files Scanned: %d", m->files);
+    gchar *t_txt = g_strdup_printf("Threats Found: %d", m->threats);
+    gtk_label_set_text(GTK_LABEL(app->result_files_label), f_txt);
+    gtk_label_set_text(GTK_LABEL(app->result_threats_label), t_txt);
+    g_free(f_txt);
+    g_free(t_txt);
+
+    if (m->status == SCAN_TERM_ABORTED && app->progress_label) {
+        gtk_label_set_text(GTK_LABEL(app->progress_label),
+            "Scan stopped by user.");
+    } else if (m->status == SCAN_TERM_EMPTY && app->progress_label) {
+        gtk_label_set_text(GTK_LABEL(app->progress_label),
+            "No scannable files were found in the target.");
+    }
+
+    reload_history_view(app);
+    app->scan_view_active = FALSE;
+    gtk_stack_set_visible_child_name(GTK_STACK(app->stack), "complete");
+
+    g_free(m->err);
+    g_free(m);
+    return G_SOURCE_REMOVE;
 }
 
 /**
@@ -164,6 +239,13 @@ static void post_scan_error(AppState *app, const char *msg)
 
 /**
  * @brief Background thread: Orchestrates the scan core logic with error handling.
+ *
+ * MAP-01/MAP-09: signature-DB loading is DECOUPLED from scan dispatch.
+ * The worker no longer pre-loads the DB or aborts when it is missing;
+ * the scan core treats the load as advisory (heuristic-only mode) and
+ * enumeration always runs. The terminal state is reported through a
+ * single authoritative g_idle_add(scan_terminal_cb) posted here, AFTER
+ * scan_progress_finish(), so no main-loop race can swallow the result.
  */
 static gpointer scan_worker_thread(gpointer user_data)
 {
@@ -181,46 +263,49 @@ static gpointer scan_worker_thread(gpointer user_data)
 
     int result = SCANCORE_OK;
 
-    /* Attempt to load the signature database; if missing, abort immediately */
-    if (signature_db_load(db_path) != 0) {
-        result = SCANCORE_FILE_ERR;
+    /* Dispatch to appropriate scan type. No signature_db_load() gate here:
+     * the scan core performs an advisory load and always enumerates. */
+    if (strcmp(mode, "QUICK_SCAN") == 0) {
+        /* v1.2: Quick scan uses scan_core_quick_scan() which performs:
+         *   1. Running process image scan (Phase B1)
+         *   2. Registry persistence target scan (Phase B2)
+         *   3. Targeted filesystem walk with extension + mtime filters (Phase A)
+         * This replaces the old approach of iterating get_quick_scan_paths()
+         * and calling scan_core_start_scan() for each. */
+        result = scan_core_quick_scan(db_path);
+    } else if (strcmp(mode, "FULL_SYSTEM") == 0) {
+        result = scan_core_start_scan(db_path, "C:\\Users", false, false);
     } else {
-        /* Dispatch to appropriate scan type */
-        if (strcmp(mode, "QUICK_SCAN") == 0) {
-            /* v1.2: Quick scan now uses scan_core_quick_scan() which performs:
-             *   1. Running process image scan (Phase B1)
-             *   2. Registry persistence target scan (Phase B2)
-             *   3. Targeted filesystem walk with extension + mtime filters (Phase A)
-             * This replaces the old approach of iterating get_quick_scan_paths()
-             * and calling scan_core_start_scan() for each. */
-            result = scan_core_quick_scan(db_path);
-        } else if (strcmp(mode, "FULL_SYSTEM") == 0) {
-            result = scan_core_start_scan(db_path, "C:\\Users", false, false);
-        } else {
-            /* Custom directory scan */
-            result = scan_core_start_scan(db_path, mode, false, false);
-        }
+        /* Custom directory scan */
+        result = scan_core_start_scan(db_path, mode, false, false);
     }
 
-    if (result != SCANCORE_OK) {
-        AppState *app = NULL;
-        g_mutex_lock(&global_scan_ctx.mutex);
-        app = global_scan_ctx.app_state;
-        g_mutex_unlock(&global_scan_ctx.mutex);
-        if (app) {
-            post_scan_error(app,
-                "Scan failed: signature database not loaded.\n"
-                "Please update definitions in Settings.");
-        }
-        /* Mark progress as finished so the poller stops */
-        scan_progress_finish();
-    } else {
-        scan_progress_finish();
-    }
+    scan_progress_finish();
 
     g_mutex_lock(&global_scan_ctx.mutex);
     global_scan_ctx.is_running = false;
+    AppState *app = global_scan_ctx.app_state;
     g_mutex_unlock(&global_scan_ctx.mutex);
+
+    /* --- Single authoritative terminal message (MAP-01) --- */
+    ScanTermMsg *m = g_new0(ScanTermMsg, 1);
+    m->app     = app;
+    m->files   = scan_progress_files_scanned();
+    m->threats = scan_progress_threats_found();
+
+    if (result != SCANCORE_OK) {
+        m->status = SCAN_TERM_ERR_GENERIC;
+        m->err = g_strdup("Scan failed: the scan core returned an error.");
+    } else if (!scan_core_db_available()) {
+        /* Advisory warning, NOT an abort: heuristics/ML still ran. */
+        m->status = SCAN_TERM_ERR_NO_DB;
+    } else if (scan_progress_files_scanned() == 0) {
+        m->status = SCAN_TERM_EMPTY;
+    } else {
+        m->status = SCAN_TERM_OK;
+    }
+
+    g_idle_add(scan_terminal_cb, m);
 
     g_free(mode);
     return NULL;

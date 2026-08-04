@@ -33,6 +33,14 @@
  * ========================================================================== */
 
 static CRITICAL_SECTION g_bridge_lock;
+static INIT_ONCE g_bridge_init_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK bridge_init_lock_cb(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_bridge_lock);
+    return TRUE;
+}
 
 /* External from scan_core */
 extern volatile LONG g_pending_tasks;
@@ -108,6 +116,11 @@ bool scan_report_is_idle(void) {
 
 void scan_report_submit_complete(ScanInput *input, const SignatureResult *sig,
                                  const HeuristicResult *heur, double ml_score) {
+  /* Self-initialize the lock: submit_complete is the entry point reached
+   * from worker threads and must not depend on a prior
+   * scan_report_bridge_init() call (the standalone test harness never
+   * calls it). InitOnce is one-time and idempotent. */
+  InitOnceExecuteOnce(&g_bridge_init_once, bridge_init_lock_cb, NULL, NULL);
   EnterCriticalSection(&g_bridge_lock);
 
   if (heur != NULL && heur->verdict != VERDICT_BENIGN) {
