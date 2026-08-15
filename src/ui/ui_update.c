@@ -200,6 +200,10 @@ static gboolean check_manual_update_progress(gpointer user_data)
         gtk_label_set_text(GTK_LABEL(g_update_status_label), full_msg);
         gtk_label_set_wrap(GTK_LABEL(g_update_status_label), TRUE);
         gtk_label_set_max_width_chars(GTK_LABEL(g_update_status_label), 60);
+        /* Release the singleton so the user can click "Update Now" again.
+         * The error window itself stays open (owned by GTK) until the user
+         * closes it, so the message remains readable. */
+        g_update_dialog = NULL;
         return G_SOURCE_REMOVE;
     }
 
@@ -217,6 +221,14 @@ void on_update_clicked(GtkButton* btn, gpointer user_data)
 {
     (void)btn;
     AppState* app = (AppState*)user_data;
+
+    /* One manual update at a time: the dialog and its widgets are static
+     * singletons, and update_signature_db() serialises in the engine —
+     * a second click would orphan the first dialog's progress polling. */
+    if (g_update_dialog != NULL) {
+        gtk_window_present(GTK_WINDOW(g_update_dialog));
+        return;
+    }
 
     g_update_dialog = gtk_window_new();
     gtk_window_set_title(GTK_WINDOW(g_update_dialog), "Database Update");

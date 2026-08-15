@@ -333,10 +333,12 @@ class FileLock:
         finally:
             self.fd.close()
             self.fd = None
-            try:
-                self.path.unlink()
-            except OSError:
-                pass
+            # NOTE: the lock file is intentionally NOT unlinked. Unlinking
+            # after unlocking opens a race where another process acquires
+            # the lock on the same inode just before we delete it, allowing
+            # a third process to create a fresh (unlocked) file and run
+            # concurrently. Leaving the empty file behind is harmless: the
+            # lock is the byte-range lock, not the file's existence.
 
     def __enter__(self):
         return self
@@ -383,7 +385,11 @@ _source_pct: dict = {}
 def _emit(event: dict):
     """Emit a JSONL event to stdout. Always flushes."""
     event["ts"] = datetime.now(timezone.utc).isoformat()
-    print(json.dumps(event), flush=True)
+    try:
+        print(json.dumps(event), flush=True)
+    except (BrokenPipeError, OSError):
+        # Parent process pipe is gone/broken; continue aggregation silently
+        pass
 
 
 def _compute_global_pct() -> int:
@@ -428,8 +434,8 @@ def emit_source_done(source: str, count: int, elapsed_sec: float):
     })
 
 
-def emit_source_fail(source: str, error: str):
-    logger.error(f"Source {source} failed: {error}")
+def emit_source_fail(source: str, error: str, exc_info: bool = False):
+    logger.error(f"Source {source} failed: {error}", exc_info=exc_info)
     # On failure, leave the source's pct where it was — don't bump to 100%,
     # because the source didn't complete. The global progress will continue
     # to advance as other sources progress.
@@ -575,6 +581,11 @@ def download_to_file(url: str, dest: Path, source_name: str,
                     mb_done = downloaded // 1024 // 1024
                     emit_progress(source_name, 50,
                                   f"downloading ({mb_done}MB)")
+        # U-11: never process a truncated payload. If the server announced a
+        # Content-Length and the stream came up short, the transfer is bad.
+        if total > 0 and downloaded != total:
+            raise DownloadError(
+                f"short read from {url}: {downloaded}/{total} bytes")
         tmp.replace(dest)
     except Exception:
         try:
@@ -601,6 +612,11 @@ def init_db(db_path: Path):
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        # U-19: enable incremental auto-vacuum so run_update can reclaim
+        # pages cheaply instead of running a full VACUUM. Must be set before
+        # the first tables are created to take effect (no-op on existing DBs
+        # until a one-time manual VACUUM).
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
 
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS hashes (
@@ -1266,6 +1282,7 @@ class Aggregator:
                 results[adapter.name] = ("failed", str(e))
             except Exception as e:
                 # Catch-all so one bad source doesn't kill the whole run
+                logger.exception(f"Source {adapter.name} raised")  # Full traceback to updater.log
                 try:
                     conn.rollback()
                 except sqlite3.OperationalError:
@@ -1273,12 +1290,25 @@ class Aggregator:
                 emit_source_fail(adapter.name, f"unexpected error: {type(e).__name__}: {e}")
                 results[adapter.name] = ("failed", str(e))
 
-        # Compact DB
+        # U-19: replace the unconditional VACUUM (which rewrites the whole
+        # 1.1M-row database on every update) with an incremental vacuum that
+        # only returns already-freed pages. init_db enables auto_vacuum for
+        # new databases; older databases keep the previous layout until a
+        # manual `VACUUM` is run once.
         try:
             conn.commit()
-            conn.execute("VACUUM")
+            conn.execute("PRAGMA incremental_vacuum")
         except sqlite3.OperationalError as e:
-            logger.warning(f"VACUUM failed: {e}")
+            logger.debug(f"incremental_vacuum skipped: {e}")
+
+        # U-12: flush the WAL back into the main database file before
+        # closing. The C engine computes its HMAC integrity file over the
+        # physical .db file; a live -wal would make the logical database
+        # state diverge from the bytes that get authenticated.
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError as e:
+            logger.warning(f"wal_checkpoint(TRUNCATE) failed: {e}")
 
         after_count = 0
         after_links = 0

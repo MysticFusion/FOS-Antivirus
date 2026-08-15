@@ -12,6 +12,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 
 #include "scan_persistence.h"
+#include "path_utils.h"
 
 #include <windows.h>
 #include <stdio.h>
@@ -25,22 +26,34 @@
 
 /**
  * @brief Add a path to the list if it's not already present and the file exists.
+ *
+ * MAPv3 U-03: closes the check-then-open TOCTOU (CWE-367). The old code
+ * verified existence with GetFileAttributesA and deferred the real open to
+ * the scanner, leaving a window where the path could be swapped for a
+ * junction. Now the file is opened IMMEDIATELY (CreateFileW via
+ * fos_open_canonical) and the recorded path is the handle-derived canonical
+ * path (GetFinalPathNameByHandleW), so the scanner's later re-open targets
+ * the same object.
  */
 static void add_path_if_unique(GList **list, const char *path) {
     if (!path || !*path)
         return;
 
-    /* Verify the file actually exists on disk */
-    if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+    wchar_t wide[FOS_MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, FOS_MAX_PATH) <= 0)
+        return;
+
+    char canonical[FOS_MAX_PATH];
+    if (fos_open_canonical(wide, true, canonical, sizeof(canonical), NULL) != 0)
         return;
 
     /* Linear search for deduplication */
     for (GList *iter = *list; iter != NULL; iter = iter->next) {
-        if (_stricmp((const char *)iter->data, path) == 0)
+        if (_stricmp((const char *)iter->data, canonical) == 0)
             return;
     }
 
-    *list = g_list_append(*list, _strdup(path));
+    *list = g_list_append(*list, _strdup(canonical));
 }
 
 /**

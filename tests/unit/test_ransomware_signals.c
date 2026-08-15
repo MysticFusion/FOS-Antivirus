@@ -153,6 +153,39 @@ static void test_confirmation_rate_plus_ext(void)
     TEST_ASSERT_TRUE(rw_signals_confirmed(rw_tracker_signals(t, 605, true)));
 }
 
+/* --- U-07: bulk rename storms must not blind the tracker ------------------ */
+
+static void test_rename_storm_does_not_exhaust_slots(void)
+{
+    /* A benign bulk rename (git checkout / compiler output / renormalize)
+     * generates far more unmatched rename-old events than the legacy fixed
+     * 64-slot table could hold. After the storm, the ACTUAL extension
+     * rewrites must still be tracked. */
+    for (int i = 0; i < 5000; i++) {
+        rw_tracker_on_rename_old(t, 700, 100000 + i, L".tmp");
+        /* no rename_new: the pair never completes (unmatched storm) */
+    }
+    /* The real ransomware-style rewrites arrive after the storm. */
+    for (int i = 0; i < RW_EXT_THRESHOLD; i++) {
+        rw_tracker_on_rename_old(t, 701, 200000 + i, L".doc");
+        rw_tracker_on_rename_new(t, 701, 200000 + i, L".locked");
+    }
+    TEST_ASSERT_EQUAL_INT(RW_SIG_EXT, rw_tracker_signals(t, 702, false) & RW_SIG_EXT);
+}
+
+static void test_storm_growth_bounded(void)
+{
+    /* Repeated refresh of the SAME file id must not grow the table. */
+    for (int i = 0; i < 1000; i++) {
+        rw_tracker_on_rename_old(t, 800, 42, L".doc");
+    }
+    for (int i = 0; i < RW_EXT_THRESHOLD; i++) {
+        rw_tracker_on_rename_old(t, 801, 300000 + i, L".doc");
+        rw_tracker_on_rename_new(t, 801, 300000 + i, L".crypt");
+    }
+    TEST_ASSERT_EQUAL_INT(RW_SIG_EXT, rw_tracker_signals(t, 802, false) & RW_SIG_EXT);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -170,5 +203,7 @@ int main(void)
     RUN_TEST(test_confirmation_requires_two_signals);
     RUN_TEST(test_confirmation_ext_plus_scope);
     RUN_TEST(test_confirmation_rate_plus_ext);
+    RUN_TEST(test_rename_storm_does_not_exhaust_slots);
+    RUN_TEST(test_storm_growth_bounded);
     return UNITY_END();
 }

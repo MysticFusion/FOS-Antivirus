@@ -3,13 +3,19 @@
  * @brief HMAC-SHA256 integrity protection for the signature database (I-22/R-09).
  *
  * MAP-04: the HMAC key is no longer a compile-time constant embedded in the
- * binary (recoverable with `strings`/disassembly). It is now derived at
- * runtime from a DPAPI-protected blob (CryptProtectData,
- * CRYPTPROTECT_LOCAL_MACHINE), so the key material never appears in the
- * image and an attacker needs the machine's DPAPI master key (or process
+ * binary (recoverable with `strings`/disassembly). It is derived at
+ * runtime from a DPAPI-protected blob, so the key material never appears
+ * in the image and an attacker needs the DPAPI master key (or process
  * memory) to forge a valid HMAC. The derived key is cached in memory after
  * first derivation. If DPAPI fails, the operation FAILS CLOSED — the DB is
  * refused rather than verified with a weaker/absent key.
+ *
+ * MAPv3 U-13: the primary key is now USER-bound (default
+ * CryptProtectData semantics — no CRYPTPROTECT_LOCAL_MACHINE). The old
+ * machine-bound key is still derived once for VERIFY ONLY, so databases
+ * (and .hmac sidecars) written by older builds keep loading; every new
+ * write uses the user-bound key, migrating the sidecar on the next
+ * update.
  */
 #define _CRT_SECURE_NO_WARNINGS
 #include "db_hmac.h"
@@ -26,44 +32,56 @@
 #define HMAC_BLOCK_SIZE 64
 
 /* ============================================================================
- * MAP-04: DPAPI-derived key (machine-bound, cached in memory)
+ * MAP-04/U-13: DPAPI-derived keys (user-bound primary + machine-bound
+ * legacy verify fallback), cached in memory
  * ========================================================================== */
 
 static SRWLOCK g_db_key_lock = SRWLOCK_INIT;
-static uint8_t g_db_key[DB_HMAC_SIZE];
-static bool    g_db_key_ready = false;
+static uint8_t g_db_key_user[DB_HMAC_SIZE];
+static bool    g_db_key_user_ready = false;
+static uint8_t g_db_key_machine[DB_HMAC_SIZE];
+static bool    g_db_key_machine_ready = false;
 
 /**
  * @brief Derive (once) and return the 32-byte DB-HMAC key.
  *
- * CryptProtectData() binds a small label blob to the machine SID; the
- * 32-byte key is SHA-256 of that protected blob. Because the protected
- * blob is deterministic for a given machine, the same key is derived on
- * write (update) and verify (load) without any key file being stored.
+ * CryptProtectData() protects a small label blob; the 32-byte key is
+ * SHA-256 of that blob. The protected blob is deterministic for a given
+ * user/machine, so the same key is derived on write (update) and verify
+ * (load) without any key file being stored.
  *
+ * @param machine_bound true -> legacy MAP-04 key (CRYPTPROTECT_LOCAL_MACHINE,
+ *                      verify-only); false -> U-13 user-bound key (primary).
  * @return 0 on success, -1 on DPAPI failure (fail-closed).
  */
-static int derive_db_key(uint8_t out[DB_HMAC_SIZE])
+static int derive_db_key(uint8_t out[DB_HMAC_SIZE], bool machine_bound)
 {
     if (!out) return -1;
 
     AcquireSRWLockExclusive(&g_db_key_lock);
-    if (g_db_key_ready) {
-        memcpy(out, g_db_key, DB_HMAC_SIZE);
+    uint8_t *cached   = machine_bound ? g_db_key_machine : g_db_key_user;
+    bool    *is_ready = machine_bound ? &g_db_key_machine_ready
+                                      : &g_db_key_user_ready;
+    if (*is_ready) {
+        memcpy(out, cached, DB_HMAC_SIZE);
         ReleaseSRWLockExclusive(&g_db_key_lock);
         return 0;
     }
 
     /* Fixed label: not secret, but required to make the DPAPI blob
-     * machine-deterministic and context-bound to this application. */
-    static const BYTE k_seed[] = "FOS-Antivirus-SigDB-HMAC-v1";
-    DATA_BLOB in  = { (DWORD)(sizeof(k_seed) - 1), (BYTE *)k_seed };
+     * deterministic and context-bound to this application. */
+    static const BYTE k_seed_user[]    = "FOS-Antivirus-SigDB-HMAC-v1";
+    static const BYTE k_seed_machine[] = "FOS-Antivirus-SigDB-HMAC-v1-legacy";
+    DATA_BLOB in  = { (DWORD)(sizeof(k_seed_user) - 1),
+                      (BYTE *)(machine_bound ? k_seed_machine : k_seed_user) };
     DATA_BLOB blob = { 0, NULL };
 
-    BOOL ok = CryptProtectData(&in, L"FOS-Antivirus Signature Database Integrity",
-                               NULL, NULL, NULL,
-                               CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN,
-                               &blob);
+    BOOL ok = CryptProtectData(
+        &in, L"FOS-Antivirus Signature Database Integrity",
+        NULL, NULL, NULL,
+        (machine_bound ? CRYPTPROTECT_LOCAL_MACHINE : 0) |
+            CRYPTPROTECT_UI_FORBIDDEN,
+        &blob);
 
     if (!ok || blob.pbData == NULL || blob.cbData == 0) {
         ReleaseSRWLockExclusive(&g_db_key_lock);
@@ -73,11 +91,11 @@ static int derive_db_key(uint8_t out[DB_HMAC_SIZE])
     sha256_ctx ctx;
     sha256_init(&ctx);
     sha256_update(&ctx, blob.pbData, blob.cbData);
-    sha256_final(&ctx, g_db_key);
+    sha256_final(&ctx, cached);
     LocalFree(blob.pbData);
 
-    g_db_key_ready = true;
-    memcpy(out, g_db_key, DB_HMAC_SIZE);
+    *is_ready = true;
+    memcpy(out, cached, DB_HMAC_SIZE);
     ReleaseSRWLockExclusive(&g_db_key_lock);
     return 0;
 }
@@ -86,12 +104,20 @@ static int derive_db_key(uint8_t out[DB_HMAC_SIZE])
  * HMAC-SHA256 (keyed) over the raw database bytes
  * ========================================================================== */
 
-int db_hmac_compute_file(const char *db_path, uint8_t out[DB_HMAC_SIZE])
+/**
+ * @brief Compute the HMAC of the database file under a specific key mode.
+ *
+ * @param machine_bound true -> legacy MAP-04 machine-bound key (verify
+ *                      fallback only); false -> U-13 user-bound key.
+ */
+static int db_hmac_compute_file_key(const char *db_path,
+                                    uint8_t out[DB_HMAC_SIZE],
+                                    bool machine_bound)
 {
     if (!db_path || !out) return -1;
 
     uint8_t db_key[DB_HMAC_SIZE];
-    if (derive_db_key(db_key) != 0) return -1; /* fail-closed */
+    if (derive_db_key(db_key, machine_bound) != 0) return -1; /* fail-closed */
 
     fos_path_t fp;
     if (!fos_path_init(&fp, db_path)) return -1;
@@ -148,19 +174,36 @@ static int read_hmac_file(const char *db_path, uint8_t expected[DB_HMAC_SIZE])
     return 0;
 }
 
+/* Constant-time comparison of two HMACs. */
+static unsigned hmac_diff(const uint8_t a[DB_HMAC_SIZE],
+                          const uint8_t b[DB_HMAC_SIZE])
+{
+    unsigned diff = 0;
+    for (int i = 0; i < DB_HMAC_SIZE; i++) diff |= (unsigned)(a[i] ^ b[i]);
+    return diff;
+}
+
 int db_hmac_verify_file(const char *db_path)
 {
     if (!db_path) return -1;
     uint8_t expected[DB_HMAC_SIZE];
     if (read_hmac_file(db_path, expected) != 0) return -1;
 
+    /* U-13: primary check under the user-bound key... */
     uint8_t actual[DB_HMAC_SIZE];
-    if (db_hmac_compute_file(db_path, actual) != 0) return -1;
+    if (db_hmac_compute_file_key(db_path, actual, false) != 0) return -1;
+    if (hmac_diff(actual, expected) == 0) return 0;
 
-    /* Constant-time comparison. */
-    unsigned diff = 0;
-    for (int i = 0; i < DB_HMAC_SIZE; i++) diff |= (unsigned)(actual[i] ^ expected[i]);
-    return diff == 0 ? 0 : -1;
+    /* ...then a one-time fallback under the legacy machine-bound key so
+     * sidecars written by pre-U-13 builds keep loading. New writes always
+     * use the user-bound key, so the sidecar migrates on the next update. */
+    if (db_hmac_compute_file_key(db_path, actual, true) != 0) return -1;
+    return hmac_diff(actual, expected) == 0 ? 0 : -1;
+}
+
+int db_hmac_compute_file(const char *db_path, uint8_t out[DB_HMAC_SIZE])
+{
+    return db_hmac_compute_file_key(db_path, out, false);
 }
 
 int db_hmac_write_file(const char *db_path)

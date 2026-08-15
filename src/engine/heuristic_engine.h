@@ -18,6 +18,19 @@ extern "C" {
 #include "trust.h"
 
 /* ============================================================================
+ * Decision Thresholds (single source of truth)
+ *
+ * heuristic_engine.c (verdict classification), scan_executor.c (response
+ * action) and scan_core.c (double-extension re-derivation) must all agree.
+ * They previously drifted (45 vs 50 for the "suspicious / monitor" gate),
+ * which made files scored 45-49 log VERDICT_SUSPICIOUS while being
+ * ACTION_ALLOW-ed.
+ * ========================================================================== */
+
+#define HEURISTIC_SCORE_MALICIOUS  90  /**< Quarantine-grade heuristic score */
+#define HEURISTIC_SCORE_SUSPICIOUS 45  /**< Monitor-grade heuristic score  */
+
+/* ============================================================================
  * Threat Verdict Enumeration
  * ========================================================================== */
 

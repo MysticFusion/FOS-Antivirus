@@ -27,6 +27,7 @@ set(UTIL_SOURCES
 )
 
 set(ENGINE_SOURCES
+    src/engine/amsi_scan.c
     src/engine/db_hmac.c
     src/engine/ed25519_verify.c
     src/engine/feature_extract.c
@@ -202,7 +203,22 @@ if(BUILD_TESTING)
     )
     add_test(NAME unit_test_path_utils COMMAND unit_test_path_utils)
 
-    # R-05 content-aware ransomware signal tracker (I-09)
+    # MAPv3 U-03/U-04: atomic open + handle-derived canonical path.
+    # Junction-swap detection must be decided from the opened handle
+    # (fos_open_canonical), never from stale find-data / GetFileAttributes.
+    add_executable(unit_test_toctou
+        tests/unit/test_toctou.c
+        ${UNITY_SOURCES}
+        src/utils/path_utils.c
+    )
+    target_include_directories(unit_test_toctou PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/utils
+        ${CMAKE_SOURCE_DIR}/tests/unity
+    )
+    add_test(NAME unit_test_toctou COMMAND unit_test_toctou)
+
+    # R-05 content-aware ransomware signal tracker (I-09); U-07 regression
+    # tests cover the growable rename-slot tables.
     add_executable(unit_test_ransomware_signals
         tests/unit/test_ransomware_signals.c
         ${UNITY_SOURCES}
@@ -210,6 +226,17 @@ if(BUILD_TESTING)
     )
     target_include_directories(unit_test_ransomware_signals PRIVATE ${TEST_INCLUDE_DIRS})
     add_test(NAME unit_test_ransomware_signals COMMAND unit_test_ransomware_signals)
+
+    # U-10: AMSI client integration (amsi.dll loaded dynamically; the test
+    # is environment-tolerant — benign content must never be MALWARE).
+    add_executable(unit_test_amsi
+        tests/unit/test_amsi.c
+        ${UNITY_SOURCES}
+        src/engine/amsi_scan.c
+        src/utils/path_utils.c
+    )
+    target_include_directories(unit_test_amsi PRIVATE ${TEST_INCLUDE_DIRS})
+    add_test(NAME unit_test_amsi COMMAND unit_test_amsi)
 
     # R-07 hardened heuristics (I-10 / I-20): PE-aware signals, exact
     # known-folder path validation, synthetic-PE parsing.
@@ -238,7 +265,9 @@ if(BUILD_TESTING)
         src/utils/path_utils.c
     )
     target_include_directories(security_test_model_signature PRIVATE ${TEST_INCLUDE_DIRS})
-    add_test(NAME security_test_model_signature COMMAND security_test_model_signature)
+    add_test(NAME security_test_model_signature
+             COMMAND security_test_model_signature
+                     "${CMAKE_SOURCE_DIR}/assets/models")
 
     # Real-file ML score regression through the full C pipeline
     # (gracefully skips when the system sample files are absent)
@@ -276,6 +305,8 @@ if(BUILD_TESTING)
         ${TEST_INCLUDE_DIRS}
         ${CMAKE_BINARY_DIR}/generated
     )
+    # bcrypt: hash_util.c uses BCryptGenRandom for the U-15 SipHash key
+    target_link_libraries(security_test_script_pin PRIVATE bcrypt)
     add_test(NAME security_test_script_pin
         COMMAND security_test_script_pin
                 "$<TARGET_FILE_DIR:FOS-Antivirus>/scripts/hash_aggregator.py")
@@ -328,6 +359,7 @@ if(BUILD_TESTING)
         tests/security/test_scan_nodb.c
         ${UNITY_SOURCES}
         src/app/app_paths.c
+        src/engine/amsi_scan.c
         src/engine/db_hmac.c
         src/engine/ed25519_verify.c
         src/engine/feature_extract.c
@@ -373,4 +405,15 @@ if(BUILD_TESTING)
         crypt32
     )
     add_test(NAME security_test_scan_nodb COMMAND security_test_scan_nodb)
+
+    # U-01/U-02 regression tests (aggregator stdout-pipe resilience +
+    # traceback logging). Stdlib-only script; runs wherever Python exists.
+    find_program(FOS_PYTHON_EXECUTABLE NAMES python python3)
+    if(FOS_PYTHON_EXECUTABLE)
+        add_test(NAME python_test_hash_aggregator_pipe
+                 COMMAND ${FOS_PYTHON_EXECUTABLE}
+                         "${CMAKE_SOURCE_DIR}/tests/python/test_hash_aggregator_pipe.py")
+        set_tests_properties(python_test_hash_aggregator_pipe PROPERTIES
+                             TIMEOUT 120)
+    endif()
 endif()

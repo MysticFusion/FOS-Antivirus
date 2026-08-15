@@ -23,6 +23,8 @@
 #include <windows.h>
 #include <shlwapi.h>
 #include <shellapi.h>
+#include <wintrust.h>
+#include <softpub.h>
 
 /* Mutex to serialise update_signature_db() calls across threads */
 static SRWLOCK g_update_lock = SRWLOCK_INIT;
@@ -133,6 +135,80 @@ static int validate_signature_file(const char *path) {
     return valid > 0 ? 0 : -1;
 }
 
+/* ============================================================================
+ * Python interpreter verification (MAPv3 U-06)
+ *
+ * The aggregator script is SHA-256 pinned (I-19), but the interpreter
+ * executing it is attacker-controllable via PATH. Before any python.exe runs
+ * with the AV's privileges, it must pass Authenticode verification AND its
+ * signer certificate must belong to the Python Software Foundation.
+ * ========================================================================== */
+
+/**
+ * @brief Verify that python_path is Authenticode-signed by the Python
+ *        Software Foundation.
+ *
+ * Uses WinVerifyTrust (WINTRUST_ACTION_GENERIC_VERIFY_V2) on the file and
+ * extracts the signer certificate subject from the provider state. The chain
+ * is validated against the local cache only (no network revocation fetch) so
+ * updates still work offline; the signer-subject check is the decisive gate.
+ *
+ * @return true when the file is validly signed by the PSF.
+ */
+static bool verify_python_interpreter(const char *python_path)
+{
+    if (!python_path || !*python_path) return false;
+
+    wchar_t wide[FOS_MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, python_path, -1, wide, FOS_MAX_PATH) <= 0)
+        return false;
+
+    WINTRUST_FILE_INFO file_info;
+    memset(&file_info, 0, sizeof(file_info));
+    file_info.cbStruct = sizeof(file_info);
+    file_info.pcwszFilePath = wide;
+
+    WINTRUST_DATA wtd;
+    memset(&wtd, 0, sizeof(wtd));
+    wtd.cbStruct = sizeof(wtd);
+    wtd.dwUnionChoice = WTD_CHOICE_FILE;
+    wtd.pFile = &file_info;
+    wtd.dwStateAction = WTD_STATEACTION_VERIFY;
+    wtd.dwProvFlags = WTD_REVOCATION_CHECK_NONE | WTD_CACHE_ONLY_URL_RETRIEVAL;
+
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    LONG rc = WinVerifyTrust(NULL, &action, &wtd);
+    if (rc != ERROR_SUCCESS) {
+        return false;
+    }
+
+    bool trusted = false;
+    do {
+        CRYPT_PROVIDER_DATA *pdata = WTHelperProvDataFromStateData(wtd.hWVTStateData);
+        if (pdata == NULL) break;
+        CRYPT_PROVIDER_SGNR *psgnr = WTHelperGetProvSignerFromChain(pdata, 0, FALSE, 0);
+        if (psgnr == NULL || psgnr->csCertChain == 0 || psgnr->pasCertChain == NULL) break;
+
+        /* The first certificate in the signer chain is the leaf signer cert. */
+        CRYPT_PROVIDER_CERT *signer_cert = &psgnr->pasCertChain[0];
+        if (signer_cert == NULL || signer_cert->pCert == NULL) break;
+
+        /* The signer certificate subject must identify the PSF. */
+        wchar_t subject[256];
+        DWORD n = CertNameToStrW(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                                 &signer_cert->pCert->pCertInfo->Subject,
+                                 CERT_X500_NAME_STR, subject, 256);
+        if (n <= 0) break;
+        trusted = (StrStrIW(subject, L"Python Software Foundation") != NULL);
+    } while (0);
+
+    /* Close the WinVerifyTrust state so the provider is freed. */
+    wtd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, &action, &wtd);
+
+    return trusted;
+}
+
 int signature_db_validate_file(const char *sigdb_path) {
     return validate_signature_file(sigdb_path);
 }
@@ -185,6 +261,14 @@ const char *update_error_code_to_message(int code) {
             return "Update failed: hash_aggregator.py failed its integrity check. The "
                    "script next to the executable does not match the build-time hash; "
                    "reinstall FOS Antivirus or update the build.";
+        case UPDATE_ERR_PYTHON_UNTRUSTED:
+            return "Update failed: the Python interpreter is not digitally signed by "
+                   "the Python Software Foundation and was refused. Install Python "
+                   "3.8+ from python.org and try again.";
+        case UPDATE_ERR_SCRIPT_DIR_DIRTY:
+            return "Update failed: unexpected Python module (.py) files found next "
+                   "to hash_aggregator.py. Remove them (they can hijack the update "
+                   "run) and try again.";
         default:
             return "Update failed due to an unknown error.";
     }
@@ -362,6 +446,47 @@ static bool find_aggregator_script(char *out_path, size_t out_sz) {
         return true;
     }
     return false;
+}
+
+/**
+ * @brief U-06b: refuse to run when extra .py modules sit beside the script.
+ *
+ * Python prepends the script's directory to sys.path (before Python 3.11
+ * there is no supported way to disable this from the command line). A
+ * planted scripts\json.py (or csv.py, sqlite3.py, ...) would be imported
+ * INSTEAD of the standard-library module, executing attacker code inside
+ * the PSF-signed interpreter. The pinned script itself is covered by the
+ * I-19 hash pin, but arbitrary new files are not — so the whole directory
+ * must contain no other importable module.
+ *
+ * @return 0 when the scripts dir is clean, -1 when it is dirty.
+ */
+static int verify_scripts_dir_clean(const char *script_path) {
+    char dir[MAX_PATH];
+    strncpy_s(dir, sizeof(dir), script_path, _TRUNCATE);
+    char *slash = strrchr(dir, '\\');
+    if (!slash) return -1;
+    *slash = '\0';
+
+    wchar_t wdir[MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, dir, -1, wdir, MAX_PATH) <= 0) return -1;
+    wchar_t pattern[MAX_PATH];
+    _snwprintf_s(pattern, MAX_PATH, _TRUNCATE, L"%s\\*.py", wdir);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW(pattern, FindExInfoBasic, &fd, FindExSearchNameMatch,
+                                NULL, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return 0; /* no extra modules */
+
+    int dirty = 0;
+    do {
+        if (_wcsicmp(fd.cFileName, L"hash_aggregator.py") != 0) {
+            dirty = -1;
+            break;
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return dirty;
 }
 
 /**
@@ -713,6 +838,18 @@ int update_signature_db(const char *db_path) {
         return -1;
     }
 
+    /* MAPv3 U-06: the interpreter must be Authenticode-signed by the Python
+     * Software Foundation before it is allowed to execute the pinned
+     * aggregator script. An attacker who modifies PATH to point at a
+     * malicious python.exe is stopped here, before any code runs with the
+     * AV's privileges. */
+    if (!verify_python_interpreter(python_path)) {
+        update_error_code = UPDATE_ERR_PYTHON_UNTRUSTED;
+        update_progress = -1;
+        ReleaseSRWLockExclusive(&g_update_lock);
+        return -1;
+    }
+
     /* 2. Find the aggregator script */
     if (!find_aggregator_script(script_path, sizeof(script_path))) {
         update_error_code = UPDATE_ERR_SCRIPT_NOT_FOUND;
@@ -731,10 +868,26 @@ int update_signature_db(const char *db_path) {
         return -1;
     }
 
+    /* 3b. U-06b: no extra importable modules beside the script (see
+     *     verify_scripts_dir_clean). */
+    if (verify_scripts_dir_clean(script_path) != 0) {
+        update_error_code = UPDATE_ERR_SCRIPT_DIR_DIRTY;
+        update_progress = -1;
+        ReleaseSRWLockExclusive(&g_update_lock);
+        return -1;
+    }
+
     /* 4. MAP-12: build the command line with CreateProcess quoting rules.
      *    Every path is wrapped in double quotes ("C:\Program Files\..." etc.).
      *    No shell is involved (no system()/ShellExecuteExA — a security
-     *    product must never route its update through a shell). */
+     *    product must never route its update through a shell).
+     *
+     *    U-06 hardening: -E ignores all PYTHON* environment variables
+     *    (PYTHONPATH/PYTHONHOME/...) inherited from the AV process, so a
+     *    user-level environment cannot shadow the interpreter's imports.
+     *    (-E is available on every Python 3 release; -P/-I would also drop
+     *    the script-dir prepend but only exist since 3.11 — the scripts-dir
+     *    check above covers that vector for older interpreters.) */
     wchar_t python_w[FOS_MAX_PATH], script_w[FOS_MAX_PATH], db_w[FOS_MAX_PATH];
     wchar_t cmdline_w[FOS_MAX_PATH * 4];
     if (MultiByteToWideChar(CP_UTF8, 0, python_path, -1,
@@ -749,8 +902,8 @@ int update_signature_db(const char *db_path) {
         return -1;
     }
     if (_snwprintf_s(cmdline_w, FOS_MAX_PATH * 4, _TRUNCATE,
-                     L"\"%s\" \"%s\" --db \"%s\" update",
-                     script_w, db_w) < 0) {
+                     L"\"%s\" -E \"%s\" --db \"%s\" update",
+                     python_w, script_w, db_w) < 0) {
         update_error_code = UPDATE_ERR_PYTHON_FAILED;
         update_progress = -1;
         ReleaseSRWLockExclusive(&g_update_lock);
@@ -813,6 +966,16 @@ int update_signature_db(const char *db_path) {
 
     /* 8. Wait for the Python process to finish (with timeout) */
     DWORD wait_result = WaitForSingleObject(pi.hProcess, UPDATE_TIMEOUT_MS);
+
+    if (wait_result == WAIT_TIMEOUT) {
+        /* Kill the orphaned aggregator: leaving it running would keep the
+         * aggregator's cross-process FileLock held, so every later update
+         * would fail with "another instance is already running" until the
+         * orphan happens to exit. */
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 5000);
+    }
+
     DWORD exit_code = 0;
     GetExitCodeProcess(pi.hProcess, &exit_code);
 

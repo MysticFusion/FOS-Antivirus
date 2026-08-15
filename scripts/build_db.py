@@ -1,4 +1,5 @@
 import sqlite3
+import re
 import time
 import argparse
 from pathlib import Path
@@ -11,9 +12,22 @@ except ImportError:
     import json
     USING_ORJSON = False
 
+# U-17: identifiers (table + column names) are interpolated into DDL/DML via
+# f-strings. Values must never originate from untrusted JSONL keys; restrict
+# to the conservative SQLite identifier grammar (ASCII letters, digits,
+# underscore, not starting with a digit).
+_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+def validate_identifier(name, what: str) -> str:
+    if not isinstance(name, str) or not _IDENT_RE.match(name):
+        raise ValueError(
+            f"unsafe SQL {what} (U-17): {name!r} is not a plain identifier")
+    return name
+
 def ingest_directory_to_sqlite(directory_path, db_path, table_name, batch_size=100000):
     start_time = time.time()
     dir_path = Path(directory_path)
+    validate_identifier(table_name, "table name")
     
     # Grab all .jsonl files in the directory
     jsonl_files = list(dir_path.glob('*.jsonl'))
@@ -57,7 +71,8 @@ def ingest_directory_to_sqlite(directory_path, db_path, table_name, batch_size=1
                 if not first_line: continue
                 
                 record = json.loads(first_line)
-                columns = list(record.keys())
+                columns = [validate_identifier(c, "column name")
+                           for c in record.keys()]
                 cols_def = ", ".join([f'"{col}" TEXT' for col in columns])
                 cursor.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({cols_def})')
                 f.seek(0)
@@ -82,6 +97,7 @@ def ingest_directory_to_sqlite(directory_path, db_path, table_name, batch_size=1
                         
                         # Add new columns to SQLite dynamically
                         for new_key in new_keys:
+                            validate_identifier(new_key, "column name")
                             cursor.execute(f'ALTER TABLE "{table_name}" ADD COLUMN "{new_key}" TEXT')
                             columns.append(new_key)
                         

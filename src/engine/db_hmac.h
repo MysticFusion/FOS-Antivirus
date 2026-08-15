@@ -4,8 +4,10 @@
  *
  * The signature database is authenticated with a keyed HMAC-SHA256. The
  * 32-byte key is derived at runtime from a DPAPI-protected blob
- * (CryptProtectData, machine-bound — MAP-04) and cached in memory; it is
- * never embedded in the binary. The HMAC file lives next to the database
+ * (CryptProtectData) and cached in memory; it is never embedded in the
+ * binary. As of U-13 the key is USER-bound; the legacy MAP-04 machine-bound
+ * key is accepted during verification only, so existing sidecars keep
+ * loading until the next update rewrites them. The HMAC file lives next to the database
  * as "<db>.hmac" (32 raw bytes). Loaders refuse databases whose HMAC is
  * missing or mismatched (and refuse to run at all if DPAPI is unavailable),
  * so tampering with the database is detected even when the database itself

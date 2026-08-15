@@ -14,6 +14,7 @@
 
 #include "ui_history.h"
 #include "app_paths.h"
+#include "path_utils.h"
 #include <gtk/gtk.h>
 #include <windows.h>
 #include <shlwapi.h>
@@ -45,177 +46,187 @@ typedef struct {
 } HistoryActionData;
 
 /* ============================================================================
- * Internal Helpers: Path Canonicalization (v1.1 security hardening)
+ * Internal Helpers: Path Canonicalization (v1.1 hardening, U-14 rework)
  *
  * history.log is a plain text file that could be modified by malware or a
  * malicious user. Without canonicalization, an attacker could craft entries
  * like "..\\..\\Windows\\System32\\evil.exe" and trick the restore function
  * into writing to arbitrary paths.
  *
- * We now:
- *   1. Canonicalize via GetFullPathNameA (resolves .., ., forward slashes).
- *   2. Reject paths containing "\\..\\" after canonicalization (shouldn't
- *      happen if GetFullPathNameA worked, but defense-in-depth).
- *   3. Reject restore destinations under system directories (Windows\\,
- *      Program Files\\, etc.) — these are always suspicious for a quarantine
- *      restore. The user can still restore to user-profile paths.
- *   4. Reject UNC paths (\\server\share) for restore destinations.
- *   5. Quarantine-path reads (q_path) are less sensitive (we only read+delete
- *      the .vir file) but we still canonicalize to prevent symlink tricks.
+ * U-14 rework: decisions are made from OPEN HANDLES (fos_open_canonical),
+ * never from GetFullPathName + GetFileAttributes snapshots:
+ *   1. Quarantine paths (.vir) must EXIST: they are opened with
+ *      FILE_FLAG_OPEN_REPARSE_POINT and rejected when the object itself is
+ *      a reparse point, and their canonical path must sit inside the
+ *      quarantine directory.
+ *   2. Restore destinations may not exist yet (restore creates parents).
+ *      The deepest EXISTING ancestor (the parent directory) is opened and
+ *      resolved via GetFinalPathNameByHandleW, so junctions anywhere in the
+ *      existing part of the chain are resolved to their real target before
+ *      the path is ever handed to the restore engine. Textual checks
+ *      (ADS, trailing dot/space, .., UNC, drive form) still apply.
+ *   3. All buffers are FOS_MAX_PATH, not MAX_PATH.
+ *
+ * Residual risk (accepted, documented): the handle is closed after
+ * resolution and restore re-opens by path, so a junction swapped into the
+ * chain in that window could still redirect the write. Fully closing that
+ * gap requires handle-passing through the restore engine.
  * ========================================================================== */
 
-/**
- * @brief Canonicalize a path and return a newly-allocated string, or NULL on
- *        failure. The caller must free() the result.
- */
-
-static char *canonicalize_path(const char *input) {
-    if (input == NULL || input[0] == '\0') {
-        return NULL;
-    }
-    /* SECURITY: Reject ADS - colon after drive letter */
-    {
-        const char *first_colon = strchr(input, ':');
-        if (first_colon && strchr(first_colon+1, ':')) {
-            return NULL;
-        }
-        size_t len = strlen(input);
-        if (len > 0 && (input[len-1] == '.' || input[len-1] == ' ')) {
-            return NULL;
-        }
-    }
-    char full[MAX_PATH] = {0};
-    DWORD l = GetFullPathNameA(input, MAX_PATH, full, NULL);
-    if (l == 0 || l >= MAX_PATH) {
-        return NULL;
-    }
-    if (strstr(full, "\\..\\") != NULL) {
-        return NULL;
-    }
-    if (full[0] == '\\' && full[1] == '\\') {
-        return NULL;
-    }
-    if (!((full[0] >= 'A' && full[0] <= 'Z') || (full[0] >= 'a' && full[0] <= 'z')) ||
-        full[1] != ':' || full[2] != '\\') {
-        return NULL;
-    }
-    DWORD attrs = GetFileAttributesA(full);
-    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
-        return NULL;
-    }
-    return _strdup(full);
-}
-
-
-/**
- * @brief Check if a canonicalized path is under a system directory that
- *        restore operations should never write to.
- *
- * Returns TRUE if the path is SUSPICIOUS (should be rejected for restore).
- */
-static bool is_sensitive_system_path(const char *canonical_path) {
-    if (canonical_path == NULL) return true;
-
-    char lower[MAX_PATH];
-    strncpy(lower, canonical_path, MAX_PATH - 1);
-    lower[MAX_PATH - 1] = '\0';
-    _strlwr(lower);
-
-    /* Fetch system directories and check if our path is under them */
-    char win_dir[MAX_PATH] = {0};
-    if (GetWindowsDirectoryA(win_dir, MAX_PATH) > 0) {
-        char win_lower[MAX_PATH];
-        strncpy(win_lower, win_dir, MAX_PATH - 1);
-        win_lower[MAX_PATH - 1] = '\0';
-        _strlwr(win_lower);
-        size_t win_len = strlen(win_lower);
-        if (_strnicmp(lower, win_lower, win_len) == 0) {
-            /* Path is under %WINDIR% (e.g. C:\Windows) — reject */
-            return true;
-        }
-    }
-
-    /* Program Files */
-    char prog_files[MAX_PATH] = {0};
-    if (GetEnvironmentVariableA("ProgramFiles", prog_files, MAX_PATH) > 0) {
-        char pf_lower[MAX_PATH];
-        strncpy(pf_lower, prog_files, MAX_PATH - 1);
-        pf_lower[MAX_PATH - 1] = '\0';
-        _strlwr(pf_lower);
-        size_t pf_len = strlen(pf_lower);
-        if (_strnicmp(lower, pf_lower, pf_len) == 0) {
-            return true;
-        }
-    }
-
-    /* Program Files (x86) */
-    char prog_files_x86[MAX_PATH] = {0};
-    if (GetEnvironmentVariableA("ProgramFiles(x86)", prog_files_x86, MAX_PATH) > 0) {
-        char pf_lower[MAX_PATH];
-        strncpy(pf_lower, prog_files_x86, MAX_PATH - 1);
-        pf_lower[MAX_PATH - 1] = '\0';
-        _strlwr(pf_lower);
-        size_t pf_len = strlen(pf_lower);
-        if (_strnicmp(lower, pf_lower, pf_len) == 0) {
-            return true;
-        }
-    }
-
-    /* ProgramData */
-    char prog_data[MAX_PATH] = {0};
-    if (GetEnvironmentVariableA("ProgramData", prog_data, MAX_PATH) > 0) {
-        char pd_lower[MAX_PATH];
-        strncpy(pd_lower, prog_data, MAX_PATH - 1);
-        pd_lower[MAX_PATH - 1] = '\0';
-        _strlwr(pd_lower);
-        size_t pd_len = strlen(pd_lower);
-        if (_strnicmp(lower, pd_lower, pd_len) == 0) {
-            return true;
-        }
-    }
-
-    return false;
+/** Reject ADS streams (colon after the drive letter) and Win32 trailing
+ *  dot/space names. Returns true when the input passes. */
+static bool basic_text_checks(const char *input) {
+    if (input == NULL || input[0] == '\0') return false;
+    const char *first_colon = strchr(input, ':');
+    if (first_colon && strchr(first_colon + 1, ':')) return false;
+    size_t len = strlen(input);
+    if (len > 0 && (input[len - 1] == '.' || input[len - 1] == ' ')) return false;
+    return true;
 }
 
 /**
- * @brief Validate a quarantine path (the .vir file we're going to read+delete).
- *        Less strict than restore-destination validation, but still canonicalizes
- *        to prevent symlink traversal tricks.
+ * @brief Canonicalize a restore destination (may not exist yet).
  *
- * Returns TRUE if the path is safe to use for read/delete operations.
+ * @param[out] out  FOS_MAX_PATH-byte buffer receiving the canonical UTF-8 path.
+ * @return true on success; the caller frees nothing (buffer provided).
+ */
+static bool canonicalize_restore_dest(const char *input, char *out, size_t out_sz) {
+    if (!basic_text_checks(input)) return false;
+
+    wchar_t wide[FOS_MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, input, -1, wide, FOS_MAX_PATH) <= 0)
+        return false;
+
+    wchar_t full[FOS_MAX_PATH];
+    DWORD l = GetFullPathNameW(wide, FOS_MAX_PATH, full, NULL);
+    if (l == 0 || l >= FOS_MAX_PATH) return false;
+
+    if (wcsstr(full, L"\\..\\") != NULL) return false;
+    if (full[0] == L'\\' && full[1] == L'\\') return false; /* UNC */
+    if (!iswalpha((wint_t)full[0]) || full[1] != L':' || full[2] != L'\\')
+        return false;
+
+    /* Resolve the parent directory from a HANDLE: every junction in the
+     * existing part of the ancestor chain collapses to its real target. */
+    wchar_t *last_sep = wcsrchr(full, L'\\');
+    if (last_sep == NULL || last_sep == full + 2) return false;
+    const wchar_t *leaf = last_sep + 1;
+    if (*leaf == L'\0') return false;
+
+    *last_sep = L'\0'; /* full = parent dir */
+    char parent_canon[FOS_MAX_PATH];
+    bool was_reparse = false;
+    if (fos_open_canonical(full, true, parent_canon, sizeof(parent_canon),
+                           &was_reparse) == 0) {
+        if (_snprintf_s(out, out_sz, _TRUNCATE, "%s\\%s", parent_canon, leaf) < 0)
+            return false;
+        return true;
+    }
+
+    /* Parent does not exist (or cannot be opened): the restore engine's
+     * create_parent_dirs() will (re)create it. Nothing below a missing
+     * directory can be a live junction today, so accept the validated
+     * textual form. */
+    int n = WideCharToMultiByte(CP_UTF8, 0, full, -1, out, (int)out_sz - 1,
+                                NULL, NULL);
+    if (n <= 0) return false;
+    size_t used = (size_t)n - 1; /* exclude NUL */
+    if (used + 1 + wcslen(leaf) * 4 + 1 > out_sz) return false;
+    out[used] = '\\';
+    WideCharToMultiByte(CP_UTF8, 0, leaf, -1, out + used + 1,
+                        (int)(out_sz - used - 1), NULL, NULL);
+    return true;
+}
+
+/**
+ * @brief Validate + canonicalize a quarantine (.vir) path. The file must
+ *        exist, must not itself be a reparse point, and must resolve inside
+ *        the FOS quarantine directory.
+ *
+ * @return true when safe; out_canonical receives the UTF-8 canonical path.
  */
 static bool is_safe_quarantine_path(const char *input, char *out_canonical, size_t out_sz) {
-    char *canonical = canonicalize_path(input);
-    if (canonical == NULL) {
+    if (!basic_text_checks(input)) return false;
+
+    wchar_t wide[FOS_MAX_PATH];
+    if (MultiByteToWideChar(CP_UTF8, 0, input, -1, wide, FOS_MAX_PATH) <= 0)
         return false;
-    }
-    /* Quarantine files must be inside the FOS-Antivirus Quarantine directory */
+
+    char canonical[FOS_MAX_PATH];
+    bool was_reparse = true;
+    if (fos_open_canonical(wide, false, canonical, sizeof(canonical),
+                           &was_reparse) != 0)
+        return false; /* missing/unopenable */
+    if (was_reparse)
+        return false; /* the .vir artifact itself is a link */
+
     const char *q_dir = app_path_quarantine_dir();
-    char q_dir_lower[MAX_PATH];
-    strncpy(q_dir_lower, q_dir, MAX_PATH - 1);
-    q_dir_lower[MAX_PATH - 1] = '\0';
-    _strlwr(q_dir_lower);
+    if (q_dir == NULL) return false;
 
-    char canonical_lower[MAX_PATH];
-    strncpy(canonical_lower, canonical, MAX_PATH - 1);
-    canonical_lower[MAX_PATH - 1] = '\0';
-    _strlwr(canonical_lower);
-
+    char q_dir_lower[FOS_MAX_PATH];
+    strncpy_s(q_dir_lower, sizeof(q_dir_lower), q_dir, _TRUNCATE);
+    _strlwr_s(q_dir_lower, sizeof(q_dir_lower));
     size_t q_len = strlen(q_dir_lower);
-    if (_strnicmp(canonical_lower, q_dir_lower, q_len) != 0) {
-        free(canonical);
-        return false;
-    }
+    if (q_len == 0 || q_dir_lower[q_len - 1] == '\\') return false;
 
-    strncpy(out_canonical, canonical, out_sz - 1);
-    out_canonical[out_sz - 1] = '\0';
-    free(canonical);
+    char canonical_lower[FOS_MAX_PATH];
+    strncpy_s(canonical_lower, sizeof(canonical_lower), canonical, _TRUNCATE);
+    _strlwr_s(canonical_lower, sizeof(canonical_lower));
+
+    if (_strnicmp(canonical_lower, q_dir_lower, q_len) != 0) return false;
+    char sep = canonical_lower[q_len];
+    if (sep != '\\' && sep != '\0') return false;
+
+    strncpy_s(out_canonical, out_sz, canonical, _TRUNCATE);
     return true;
 }
 
 /* ============================================================================
  * Internal Helpers
  * ========================================================================== */
+
+/**
+ * @brief Check if a canonicalized path is under a system directory that
+ * restore operations should never write to (Windows, Program Files,
+ * Program Files (x86), ProgramData).
+ *
+ * Returns TRUE if the path is SUSPICIOUS (should be rejected for restore).
+ */
+static bool is_sensitive_system_path(const char *canonical_path) {
+    if (canonical_path == NULL) return true;
+
+    char lower[FOS_MAX_PATH];
+    strncpy_s(lower, sizeof(lower), canonical_path, _TRUNCATE);
+    _strlwr_s(lower, sizeof(lower));
+
+    static const struct {
+        const char *env;      /* environment variable (or NULL for windir) */
+    } k_roots[] = {
+        { NULL },             /* -> GetWindowsDirectoryA */
+        { "ProgramFiles" },
+        { "ProgramFiles(x86)" },
+        { "ProgramData" },
+    };
+
+    for (size_t i = 0; i < sizeof(k_roots) / sizeof(k_roots[0]); i++) {
+        char root[FOS_MAX_PATH];
+        if (k_roots[i].env == NULL) {
+            if (GetWindowsDirectoryA(root, FOS_MAX_PATH) == 0) continue;
+        } else {
+            if (GetEnvironmentVariableA(k_roots[i].env, root, FOS_MAX_PATH) <= 0)
+                continue;
+        }
+        _strlwr_s(root, sizeof(root));
+        size_t rlen = strlen(root);
+        if (rlen == 0) continue;
+        if (rlen > 0 && root[rlen - 1] == '\\') root[--rlen] = '\0';
+        if (_strnicmp(lower, root, rlen) == 0) {
+            char sep = lower[rlen];
+            if (sep == '\\' || sep == '\0') return true;
+        }
+    }
+    return false;
+}
 
 static gboolean reload_history_timer_cb(gpointer user_data);
 
@@ -244,7 +255,10 @@ static void on_remove_clicked(GtkButton *btn, gpointer user_data)
     (void)btn;
     HistoryActionData *data = (HistoryActionData *)user_data;
 
-    if (remove(data->q_path) == 0) {
+    /* U-14: long-path-safe delete (CRT remove() caps at MAX_PATH). */
+    fos_path_t q;
+    bool removed_ok = fos_path_init(&q, data->q_path) && fos_delete_file(&q);
+    if (removed_ok) {
         gtk_label_set_text(GTK_LABEL(data->lbl_status), "Removed");
         gtk_widget_set_sensitive(data->btn_restore, FALSE);
         gtk_widget_set_sensitive(data->btn_remove, FALSE);
@@ -341,17 +355,20 @@ void load_history_items(AppState *app)
 
         /* v1.1 security hardening: canonicalize and validate the paths
          * BEFORE using them in any file operation. If validation fails,
-         * skip this entry entirely (don't display it, don't allow restore). */
-        char canonical_q[MAX_PATH] = {0};
+         * skip this entry entirely (don't display it, don't allow restore).
+         * U-14: both helpers are handle-based; buffers are FOS_MAX_PATH. */
+        char canonical_q[FOS_MAX_PATH] = {0};
         if (!is_safe_quarantine_path(token_qpath, canonical_q, sizeof(canonical_q))) {
             /* Quarantine path failed validation — skip this entry */
             continue;
         }
-        char *canonical_orig = canonicalize_path(token_orig);
-        if (canonical_orig == NULL) {
+        char canonical_orig_buf[FOS_MAX_PATH];
+        if (!canonicalize_restore_dest(token_orig, canonical_orig_buf,
+                                       sizeof(canonical_orig_buf))) {
             /* Original path failed canonicalization — skip */
             continue;
         }
+        char *canonical_orig = canonical_orig_buf;
         /* If the original path is a sensitive system path, we still display
          * the entry but disable restore (defense-in-depth handled in
          * on_restore_clicked). Display the canonicalized path. */
@@ -434,9 +451,6 @@ void load_history_items(AppState *app)
         gtk_box_append(GTK_BOX(row), actions_box);
 
         gtk_list_box_append(GTK_LIST_BOX(app->history_list_box), row);
-
-        free(canonical_orig);
-        canonical_orig = NULL;
     }
 
     fclose(f);

@@ -171,6 +171,9 @@ def build_helper(tmpdir):
         HELPER_SRC,
         EXTRACT_SRC,
         os.path.join(ROOT, "src", "utils", "path_utils.c"),
+        # feature_extract.c resolves known folders (R-07/I-10), which needs
+        # the shell/COM imports the CMake targets already link.
+        "-lshlwapi", "-lshell32", "-lole32", "-luuid",
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:

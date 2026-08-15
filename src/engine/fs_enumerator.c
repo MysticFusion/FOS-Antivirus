@@ -24,36 +24,6 @@ typedef struct {
     int depth;
 } walk_ctx_t;
 
-/**
- * @brief Convert a (possibly "\\?\" prefixed) wide path to UTF-8 for the
- *        callback, stripping the prefix so downstream consumers (trust
- *        evaluation, known-folder matching) see a conventional path.
- *        fos_path_init re-applies the prefix when it is needed again.
- * @return 0 on success.
- */
-static int wide_to_utf8_cb(const wchar_t *wide, char *out, size_t out_sz)
-{
-    if (!wide || !out || out_sz < 4) return -1;
-
-    const wchar_t *p = wide;
-    size_t extra = 0;
-    if (wcsncmp(p, L"\\\\?\\UNC\\", 8) == 0) {
-        p += 8;          /* restore the leading "\\" of a UNC path */
-        extra = 2;
-    } else if (wcsncmp(p, L"\\\\?\\", 4) == 0) {
-        p += 4;
-    }
-
-    int n = WideCharToMultiByte(CP_UTF8, 0, p, -1,
-                                out + extra, (int)(out_sz - extra), NULL, NULL);
-    if (n <= 0) return -1;
-    if (extra == 2) {
-        out[0] = '\\';
-        out[1] = '\\';
-    }
-    return 0;
-}
-
 static void walk_recursive_wide(const wchar_t *dir, walk_ctx_t *ctx)
 {
     if (!dir || !ctx) return;
@@ -91,26 +61,69 @@ static void walk_recursive_wide(const wchar_t *dir, walk_ctx_t *ctx)
         memcpy(full + dir_len + 1, fd.cFileName, name_len * sizeof(wchar_t));
         full[dir_len + 1 + name_len] = L'\0';
 
-        /* Skip reparse points (junctions, symlinks) to prevent loops */
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+        /* MAPv3 U-04: OPEN THE CHILD IMMEDIATELY — never defer the open past
+         * enumeration. The old code skipped reparse points based on the
+         * find-data and opened the path much later; in that window an
+         * attacker could convert a normal directory into a junction pointing
+         * at C:\Windows\System32 and redirect the scan. Now:
+         *   1. CreateFileW + FILE_FLAG_OPEN_REPARSE_POINT pins the object as
+         *      it exists right now (the handle never follows a link that was
+         *      not there at enumeration time).
+         *   2. Reparse-ness is decided atomically from the HANDLE
+         *      (GetFileInformationByHandleEx), so a stale find-data decision
+         *      is impossible.
+         *   3. The canonical path passed to the callback is derived from the
+         *      same handle (GetFinalPathNameByHandleW) — the callback and the
+         *      hash stage operate on the verified object, not on the name
+         *      captured earlier.
+         * A reparse-point object is skipped (never followed): following a
+         * directory junction could both loop and escape the scan root. */
+        char *canonical = (char *)malloc(FOS_MAX_PATH);
+        if (!canonical) { free(full); continue; }
+        bool was_reparse = false;
+        if (fos_open_canonical(full, false, canonical, FOS_MAX_PATH, &was_reparse) != 0 ||
+            was_reparse) {
+            free(canonical);
             free(full);
             continue;
         }
 
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            ctx->depth++;
-            walk_recursive_wide(full, ctx);
-            ctx->depth--;
+            /* Recurse into the canonical path (fos_open_canonical already
+             * resolved any junction components above the leaf). The
+             * canonical form is unprefixed, so re-apply the long-path
+             * "\\?\" / "\\?\UNC\" prefix (mirrors fos_path_init_w) to keep
+             * deep paths enumerating (MAP-07). */
+            wchar_t *wcanon = (wchar_t *)malloc(FOS_MAX_PATH * sizeof(wchar_t));
+            if (wcanon) {
+                int n = MultiByteToWideChar(CP_UTF8, 0, canonical, -1, wcanon, FOS_MAX_PATH);
+                if (n > 0) {
+                    wchar_t *prefixed = (wchar_t *)malloc((n + 8) * sizeof(wchar_t));
+                    if (prefixed) {
+                        if (wcsncmp(wcanon, L"\\\\?\\", 4) == 0) {
+                            wcscpy_s(prefixed, n + 8, wcanon);
+                        } else if (wcanon[0] == L'\\' && wcanon[1] == L'\\') {
+                            wcscpy_s(prefixed, n + 8, L"\\\\?\\UNC\\");
+                            wcscat_s(prefixed, n + 8, wcanon + 2);
+                        } else {
+                            wcscpy_s(prefixed, n + 8, L"\\\\?\\");
+                            wcscat_s(prefixed, n + 8, wcanon);
+                        }
+                        ctx->depth++;
+                        walk_recursive_wide(prefixed, ctx);
+                        ctx->depth--;
+                        free(prefixed);
+                    }
+                }
+                free(wcanon);
+            }
         } else {
             /* Skip ADS streams (colon) */
             if (!wcschr(fd.cFileName, L':')) {
-                char *utf8 = (char *)malloc(FOS_MAX_PATH * 4);
-                if (utf8 && wide_to_utf8_cb(full, utf8, FOS_MAX_PATH * 4) == 0) {
-                    ctx->cb(utf8, ctx->user_data);
-                }
-                free(utf8);
+                ctx->cb(canonical, ctx->user_data);
             }
         }
+        free(canonical);
         free(full);
     } while (FindNextFileW(h, &fd));
 

@@ -5,9 +5,15 @@
 
 #define _CRT_SECURE_NO_WARNINGS
 
+/* FILE_BASIC_INFO (FileBasicInfo) requires _WIN32_WINNT >= 0x0600 */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
 #include "path_utils.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 bool fos_path_init(fos_path_t *p, const char *utf8_input)
@@ -123,4 +129,63 @@ FILE *fos_fopen(const fos_path_t *p, const char *mode)
     wmode[i] = L'\0';
 
     return _wfopen(p->wide, wmode);
+}
+
+int fos_open_canonical(const wchar_t *wide_path, bool follow_reparse,
+                       char *out_utf8, size_t out_sz, bool *was_reparse)
+{
+    if (!wide_path || !out_utf8 || out_sz < 8) {
+        return -1;
+    }
+
+    DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if (!follow_reparse) {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+
+    /* MAPv3 U-03/U-04: open the object NOW; every decision (existence,
+     * reparse-ness, canonical name) is made from this handle. */
+    HANDLE h = CreateFileW(wide_path, FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, flags, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    int rc = -1;
+
+    if (was_reparse) {
+        *was_reparse = false;
+        FILE_BASIC_INFO fbi;
+        if (GetFileInformationByHandleEx(h, FileBasicInfo, &fbi, sizeof(fbi)) &&
+            (fbi.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            *was_reparse = true;
+        }
+    }
+
+    /* Resolve the stable, symlink-resolved path from the handle. */
+    wchar_t *final_path = (wchar_t *)malloc(FOS_MAX_PATH * sizeof(wchar_t));
+    if (final_path != NULL) {
+        DWORD len = GetFinalPathNameByHandleW(h, final_path, FOS_MAX_PATH,
+                                              FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (len > 0 && len < FOS_MAX_PATH) {
+            /* Strip the "\\?\" / "\\?\UNC\" prefix so downstream consumers
+             * (trust evaluation, known-folder matching) see a conventional
+             * path, mirroring fs_enumerator.c's wide_to_utf8_cb. */
+            const wchar_t *p = final_path;
+            if (wcsncmp(p, L"\\\\?\\UNC\\", 8) == 0) {
+                p += 8;
+            } else if (wcsncmp(p, L"\\\\?\\", 4) == 0) {
+                p += 4;
+            }
+            if (WideCharToMultiByte(CP_UTF8, 0, p, -1, out_utf8,
+                                    (int)out_sz, NULL, NULL) > 0) {
+                rc = 0;
+            }
+        }
+        free(final_path);
+    }
+
+    CloseHandle(h);
+    return rc;
 }

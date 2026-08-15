@@ -13,16 +13,6 @@
 #include <string.h>
 
 /* ============================================================================
- * Configuration Constants
- * ========================================================================== */
-
-/** @brief Minimum score for a file to be considered malicious */
-#define THRESHOLD_MALICIOUS   90
-
-/** @brief Minimum score for a file to be considered suspicious */
-#define THRESHOLD_SUSPICIOUS  45
-
-/* ============================================================================
  * Internal Helpers
  * ========================================================================== */
 
@@ -172,9 +162,9 @@ void evaluate_heuristics(
      * Final Classification
      * ======================================================================== */
 
-    if (score >= THRESHOLD_MALICIOUS) {
+    if (score >= HEURISTIC_SCORE_MALICIOUS) {
         out->verdict = VERDICT_MALICIOUS;
-    } else if (score >= THRESHOLD_SUSPICIOUS) {
+    } else if (score >= HEURISTIC_SCORE_SUSPICIOUS) {
         out->verdict = VERDICT_SUSPICIOUS;
     } else {
         out->verdict = VERDICT_BENIGN;

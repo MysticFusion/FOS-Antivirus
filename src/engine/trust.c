@@ -3,6 +3,7 @@
 #include "trust.h"
 
 #include <ctype.h>
+#include <shlwapi.h>
 #include <shlobj.h>
 #include <softpub.h>
 #include <stdbool.h>
@@ -10,6 +11,7 @@
 #include <strsafe.h>
 #include <windows.h>
 #include <wintrust.h>
+#include <wincrypt.h>
 
 /* ============================================================================
  * Internal Helpers: Path Matching
@@ -28,14 +30,20 @@ static bool path_starts_with_w(const WCHAR *path, const WCHAR *prefix) {
 }
 
 /* ============================================================================
- * Digital Signature Verification
+ * Digital Signature Verification (U-18: publisher-based trust)
  * ========================================================================== */
 
 /**
- * @brief Verify the digital signature of a file.
+ * @brief Verify the digital signature of a file and report its signer.
+ *
+ * U-18: TRUST decisions are derived from the certificate chain, never from
+ * the file's location. After a successful WinVerifyTrust, the signer
+ * certificate's subject is extracted from the provider state; the caller
+ * decides which publishers count as HIGH trust.
  *
  * @param path                File to verify.
- * @param is_microsoft_signed Output: set to true if signed by Microsoft.
+ * @param is_microsoft_signed Output: true when the signer subject identifies
+ *                            a Microsoft production publisher.
  * @param quick_mode          If true, skip revocation checking (WTD_REVOCATION_CHECK_NONE).
  *                            If false, use cache-only revocation (WTD_REVOKE_WHOLECHAIN
  *                            + WTD_CACHE_ONLY_URL_RETRIEVAL).
@@ -57,6 +65,8 @@ static bool verify_digital_signature(const char *path,
   trust_data.dwUIChoice = WTD_UI_NONE;
   trust_data.dwUnionChoice = WTD_CHOICE_FILE;
   trust_data.pFile = &file_info;
+  /* U-18: keep the provider state so the signer chain can be inspected. */
+  trust_data.dwStateAction = WTD_STATEACTION_VERIFY;
 
   if (quick_mode) {
     /* v1.2: Quick mode — skip revocation entirely. This is much faster
@@ -73,22 +83,50 @@ static bool verify_digital_signature(const char *path,
 
   GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
   LONG status = WinVerifyTrust(NULL, &policy, &trust_data);
-  if (status != ERROR_SUCCESS)
-    return false;
 
-  /* Additional check for Microsoft Origin */
-  if (is_microsoft_signed) {
-    PWSTR win_path = NULL;
-    if (SUCCEEDED(
-            SHGetKnownFolderPath(&FOLDERID_Windows, 0, NULL, &win_path))) {
-      if (path_starts_with_w(w_path, win_path)) {
-        *is_microsoft_signed = true;
-      }
-      CoTaskMemFree(win_path);
-    }
+  bool signature_valid = (status == ERROR_SUCCESS);
+  bool microsoft_signer = false;
+
+  if (signature_valid) {
+    do {
+      CRYPT_PROVIDER_DATA *pdata =
+          WTHelperProvDataFromStateData(trust_data.hWVTStateData);
+      if (pdata == NULL)
+        break;
+      CRYPT_PROVIDER_SGNR *psgnr =
+          WTHelperGetProvSignerFromChain(pdata, 0, FALSE, 0);
+      if (psgnr == NULL || psgnr->csCertChain == 0 ||
+          psgnr->pasCertChain == NULL)
+        break;
+
+      /* The first certificate in the signer chain is the leaf signer cert. */
+      CRYPT_PROVIDER_CERT *signer_cert = &psgnr->pasCertChain[0];
+      if (signer_cert == NULL || signer_cert->pCert == NULL)
+        break;
+
+      WCHAR subject[256];
+      DWORD n = CertNameToStrW(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                               &signer_cert->pCert->pCertInfo->Subject,
+                               CERT_X500_NAME_STR, subject, 256);
+      if (n == 0)
+        break;
+
+      /* Microsoft production signers. "Microsoft Windows" covers the
+       * Windows/Hardware-compat leaf subjects; "Microsoft Corporation"
+       * covers the classic Authenticode subject. Test/flight-signing
+       * subjects intentionally do NOT match. */
+      microsoft_signer = (StrStrIW(subject, L"Microsoft Windows") != NULL ||
+                          StrStrIW(subject, L"Microsoft Corporation") != NULL);
+    } while (0);
   }
 
-  return true;
+  /* Always close the provider state so it is freed. */
+  trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
+  WinVerifyTrust(NULL, &policy, &trust_data);
+
+  if (is_microsoft_signed)
+    *is_microsoft_signed = microsoft_signer;
+  return signature_valid;
 }
 
 /* ============================================================================
@@ -105,7 +143,11 @@ TrustLevel trust_evaluate_path(const char *path, bool quick_mode) {
   PWSTR prog_path = NULL, prog86_path = NULL;
   TrustLevel result = TRUST_NONE;
 
-  /* 1. Digital Signature Verification */
+  /* 1. Digital Signature Verification.
+   * U-18: HIGH trust requires a valid Authenticode chain AND a Microsoft
+   * production publisher on the leaf certificate — never the file's path
+   * (an MS-signed binary copied into C:\Windows is still MS-signed, and a
+   * foreign binary planted there is still not). */
   bool is_microsoft = false;
   if (verify_digital_signature(path, &is_microsoft, quick_mode)) {
     return is_microsoft ? TRUST_HIGH : TRUST_PARTIAL;
@@ -138,5 +180,3 @@ TrustLevel trust_evaluate_path(const char *path, bool quick_mode) {
 int trust_is_at_least(TrustLevel actual, TrustLevel required) {
   return (actual >= required);
 }
-
-

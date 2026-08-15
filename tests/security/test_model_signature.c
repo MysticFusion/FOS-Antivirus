@@ -1,4 +1,4 @@
-﻿/**
+/**
  * test_model_signature.c -- Ed25519 model signature verification (I-03 / R-02).
  *
  * Part 1: known-answer tests against the embedded verifier using a vector
@@ -40,7 +40,9 @@ static const uint8_t KA_PK_WRONG[32] = {0x42}; /* wrong key (all 0x42) */
 static char g_model[MAX_PATH];
 static char g_sig[MAX_PATH];
 static char g_dir[MAX_PATH];
-static const char *ASSETS = "D:\\Experiment\\FOS-Antivirus\\assets\\models";
+static const char *ASSETS = "assets/models"; /* overridable via argv[1]; CTest passes the source tree path */
+static char g_model_src[MAX_PATH];
+static char g_sig_src[MAX_PATH];
 
 static void copy_file(const char *src, const char *dst) {
   FILE *f = fopen(src, "rb");
@@ -109,8 +111,8 @@ static void test_ka_noncanonical_s(void) {
 /* ---------------- Part 2: ml_engine end-to-end ---------------- */
 
 static void test_model_valid_loads(void) {
-  copy_file("D:\\Experiment\\FOS-Antivirus\\assets\\models\\forest.bin", g_model);
-  copy_file("D:\\Experiment\\FOS-Antivirus\\assets\\models\\forest.bin.sig", g_sig);
+  copy_file(g_model_src, g_model);
+  copy_file(g_sig_src, g_sig);
   ml_engine_pre_init();
   TEST_ASSERT_EQUAL_INT(0, ml_engine_init(g_model));
   FileFeatures ff;
@@ -121,8 +123,8 @@ static void test_model_valid_loads(void) {
 }
 
 static void test_model_tampered_rejected(void) {
-  copy_file("D:\\Experiment\\FOS-Antivirus\\assets\\models\\forest.bin", g_model);
-  copy_file("D:\\Experiment\\FOS-Antivirus\\assets\\models\\forest.bin.sig", g_sig);
+  copy_file(g_model_src, g_model);
+  copy_file(g_sig_src, g_sig);
   {
     FILE *f = fopen(g_model, "r+b");
     TEST_ASSERT_NOT_NULL(f);
@@ -144,14 +146,14 @@ static void test_model_tampered_rejected(void) {
 }
 
 static void test_model_missing_sig_rejected(void) {
-  copy_file("D:\\Experiment\\FOS-Antivirus\\assets\\models\\forest.bin", g_model);
+  copy_file(g_model_src, g_model);
   DeleteFileA(g_sig);
   TEST_ASSERT_NOT_EQUAL(0, ml_engine_init(g_model));
   ml_engine_cleanup();
 }
 
 static void test_model_wrong_key_sig_rejected(void) {
-  copy_file("D:\\Experiment\\FOS-Antivirus\\assets\\models\\forest.bin", g_model);
+  copy_file(g_model_src, g_model);
   {
     FILE *f = fopen(g_sig, "wb");
     TEST_ASSERT_NOT_NULL(f);
@@ -163,7 +165,7 @@ static void test_model_wrong_key_sig_rejected(void) {
 }
 
 static void test_model_truncated_sig_rejected(void) {
-  copy_file("D:\\Experiment\\FOS-Antivirus\\assets\\models\\forest.bin", g_model);
+  copy_file(g_model_src, g_model);
   {
     FILE *f = fopen(g_sig, "wb");
     TEST_ASSERT_NOT_NULL(f);
@@ -175,8 +177,8 @@ static void test_model_truncated_sig_rejected(void) {
 }
 
 static void test_model_valid_again(void) {
-  copy_file("D:\\Experiment\\FOS-Antivirus\\assets\\models\\forest.bin", g_model);
-  copy_file("D:\\Experiment\\FOS-Antivirus\\assets\\models\\forest.bin.sig", g_sig);
+  copy_file(g_model_src, g_model);
+  copy_file(g_sig_src, g_sig);
   TEST_ASSERT_EQUAL_INT(0, ml_engine_init(g_model));
   ml_engine_cleanup();
 }
@@ -184,7 +186,10 @@ static void test_model_valid_again(void) {
 void setUp(void) {}
 void tearDown(void) {}
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc > 1) ASSETS = argv[1];
+  snprintf(g_model_src, sizeof(g_model_src), "%s\\forest.bin", ASSETS);
+  snprintf(g_sig_src, sizeof(g_sig_src), "%s\\forest.bin.sig", ASSETS);
   const char *tmp = getenv("TEMP");
   if (!tmp) tmp = "C:\\Windows\\Temp";
   snprintf(g_dir, sizeof(g_dir), "%s\\fos_sig_test", tmp);

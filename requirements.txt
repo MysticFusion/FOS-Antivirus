@@ -1,5 +1,17 @@
-lightgbm
-mmh3
-numpy
-tqdm
-orjson
+# U-16: exact-version pins (supply-chain hygiene). Upgrade deliberately,
+# never via a floating `pip install --upgrade`.
+#
+# Runtime (signature-DB updater + model signing):
+#   requests      - hash_aggregator.py HTTP downloads
+#   cryptography  - scripts/sign_model.py (Ed25519)
+# Training pipeline (build_db / extract_features / train / validate):
+#   lightgbm mmh3 numpy tqdm orjson
+#
+# Pinned from the validated training environment (Python 3.13).
+requests==2.34.2
+cryptography==49.0.0
+lightgbm==4.7.0
+mmh3==5.2.1
+numpy==2.5.1
+tqdm==4.68.3
+orjson==3.11.9

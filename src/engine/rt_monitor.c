@@ -73,13 +73,25 @@ static void rt_log_event(const char *message) {
   fclose(f);
 }
 
+/* U-08: the RT filter mirrors scan_core.c's g_allowed_exts so on-access
+ * coverage matches on-demand coverage. The old list (.exe/.dll/.sys/.scr/
+ * .js/.vbs) missed primary delivery vectors like .ps1, .bat, .cmd, .hta,
+ * .jar, .py and macro documents (.docm/.xlsm/.pptm). Script-type files
+ * additionally go through the AMSI layer (amsi_scan.c) in the scan
+ * pipeline. */
 static bool is_interesting_file(const wchar_t *path) {
   if (!path) return false;
   const wchar_t *ext = PathFindExtensionW(path);
   if (!ext || *ext == L'\0') return false;
-  return (_wcsicmp(ext, L".exe") == 0 || _wcsicmp(ext, L".dll") == 0 ||
-          _wcsicmp(ext, L".sys") == 0 || _wcsicmp(ext, L".scr") == 0 ||
-          _wcsicmp(ext, L".js") == 0 || _wcsicmp(ext, L".vbs") == 0);
+  static const wchar_t *k_exts[] = {
+      L".exe", L".dll", L".sys", L".scr", L".cpl", L".ocx", L".drv",
+      L".com", L".bat", L".cmd", L".ps1", L".vbs", L".vbe", L".js",
+      L".jse", L".hta", L".wsf", L".wsh", L".msi", L".msp", L".jar",
+      L".py", L".docm", L".xlsm", L".pptm", NULL};
+  for (int i = 0; k_exts[i]; i++) {
+    if (_wcsicmp(ext, k_exts[i]) == 0) return true;
+  }
+  return false;
 }
 
 static bool wide_to_utf8(const wchar_t *w, char *out, size_t out_sz) {

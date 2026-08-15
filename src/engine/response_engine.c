@@ -49,6 +49,10 @@
 #define Q_TAG_LEN            16
 #define Q_READ_BUFFER_SIZE   (1024 * 1024) /* 1 MB streaming chunks */
 #define Q_SECURE_DELETE_PASSES 3
+/* U-09: bodies are authenticated in one GCM call, so the plaintext must fit
+ * in memory. Match the hashing layer's 500 MB ceiling — anything larger is
+ * refused by the pipeline before quarantine anyway. */
+#define Q_MAX_BODY_LEN       (500ULL * 1024 * 1024)
 
 /* ============================================================================
  * v2 Quarantine File Layout (magic 0xFEEDFACE, version 2)
@@ -213,12 +217,15 @@ static int hkdf_sha256(const uint8_t *ikm, size_t ikm_len,
 }
 
 /**
- * @brief AES-256-GCM streaming encryption over one message.
+ * @brief AES-256-GCM authenticated encryption over one message (U-09).
  *
- * Uses the CNG chained-call pattern: every call except the last carries
- * BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG and must be a multiple of the block
- * size; the last call clears the flag, may be any length, and produces
- * the authentication tag covering the entire message.
+ * Single-shot BCryptEncrypt/BCryptDecrypt. The previous implementation
+ * hand-rolled CNG's chained-call GCM mode (BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG
+ * with block-aligned intermediate calls), which is poorly documented and
+ * silently corrupts authentication on any alignment/flag mistake. Since
+ * restore already buffers the whole body in memory and quarantined files
+ * are bounded by Q_MAX_BODY_LEN, one call over the full message is both
+ * simpler and safer.
  *
  * @return 0 on success.
  */
@@ -228,10 +235,6 @@ static int gcm_encrypt_stream(BCRYPT_KEY_HANDLE key,
                               const uint8_t *in, size_t in_len,
                               uint8_t *out, uint8_t tag[Q_TAG_LEN])
 {
-    uint8_t mac_ctx[Q_TAG_LEN];
-    uint8_t iv_ctx[16];
-    memset(iv_ctx, 0, sizeof(iv_ctx));
-
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
     BCRYPT_INIT_AUTH_MODE_INFO(info);
     info.pbNonce = (PUCHAR)nonce;
@@ -240,36 +243,22 @@ static int gcm_encrypt_stream(BCRYPT_KEY_HANDLE key,
     info.cbAuthData = (ULONG)aad_len;
     info.pbTag = tag;
     info.cbTag = Q_TAG_LEN;
-    info.pbMacContext = mac_ctx;
-    info.cbMacContext = sizeof(mac_ctx);
 
-    size_t off = 0;
+    uint8_t iv_ctx[16];
+    memset(iv_ctx, 0, sizeof(iv_ctx));
+
     ULONG cb = 0;
-    while (off < in_len) {
-        size_t chunk = in_len - off;
-        int last = (off + chunk >= in_len);
-        if (!last) {
-            chunk = (chunk / 16) * 16; /* intermediate calls must be block-aligned */
-            if (chunk == 0) {
-                return -1;
-            }
-            info.dwFlags = BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
-        } else {
-            info.dwFlags = 0;
-        }
-        NTSTATUS s = BCryptEncrypt(key, (PUCHAR)(in + off), (ULONG)chunk,
-                                   &info, iv_ctx, sizeof(iv_ctx),
-                                   out + off, (ULONG)chunk, &cb, 0);
-        if (s != 0) {
-            return -1;
-        }
-        off += chunk;
+    NTSTATUS s = BCryptEncrypt(key, (PUCHAR)in, (ULONG)in_len, &info,
+                               iv_ctx, sizeof(iv_ctx),
+                               out, (ULONG)in_len, &cb, 0);
+    if (s != 0 || cb != (ULONG)in_len) {
+        return -1;
     }
     return 0;
 }
 
 /**
- * @brief AES-256-GCM streaming decryption + authentication.
+ * @brief AES-256-GCM decryption + authentication (single-shot).
  * @return 0 on success, -1 if the message is invalid/tampered.
  */
 static int gcm_decrypt_stream(BCRYPT_KEY_HANDLE key,
@@ -278,10 +267,6 @@ static int gcm_decrypt_stream(BCRYPT_KEY_HANDLE key,
                               const uint8_t *in, size_t in_len,
                               uint8_t *out, const uint8_t tag[Q_TAG_LEN])
 {
-    uint8_t mac_ctx[Q_TAG_LEN];
-    uint8_t iv_ctx[16];
-    memset(iv_ctx, 0, sizeof(iv_ctx));
-
     BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
     BCRYPT_INIT_AUTH_MODE_INFO(info);
     info.pbNonce = (PUCHAR)nonce;
@@ -290,32 +275,17 @@ static int gcm_decrypt_stream(BCRYPT_KEY_HANDLE key,
     info.cbAuthData = (ULONG)aad_len;
     info.pbTag = (PUCHAR)tag;
     info.cbTag = Q_TAG_LEN;
-    info.pbMacContext = mac_ctx;
-    info.cbMacContext = sizeof(mac_ctx);
 
-    /* The final (last-data) call verifies the tag and returns
-     * STATUS_AUTH_TAG_MISMATCH on tampering. */
-    size_t off = 0;
+    uint8_t iv_ctx[16];
+    memset(iv_ctx, 0, sizeof(iv_ctx));
+
+    /* On tampering the call fails with STATUS_AUTH_TAG_MISMATCH. */
     ULONG cb = 0;
-    while (off < in_len) {
-        size_t chunk = in_len - off;
-        int last = (off + chunk >= in_len);
-        if (!last) {
-            chunk = (chunk / 16) * 16;
-            if (chunk == 0) {
-                return -1;
-            }
-            info.dwFlags = BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
-        } else {
-            info.dwFlags = 0;
-        }
-        NTSTATUS s = BCryptDecrypt(key, (PUCHAR)(in + off), (ULONG)chunk,
-                                   &info, iv_ctx, sizeof(iv_ctx),
-                                   out + off, (ULONG)chunk, &cb, 0);
-        if (s != 0) {
-            return -1;
-        }
-        off += chunk;
+    NTSTATUS s = BCryptDecrypt(key, (PUCHAR)in, (ULONG)in_len, &info,
+                               iv_ctx, sizeof(iv_ctx),
+                               out, (ULONG)in_len, &cb, 0);
+    if (s != 0 || cb != (ULONG)in_len) {
+        return -1;
     }
     return 0;
 }
@@ -650,6 +620,17 @@ int response_quarantine_file(const char *src_path, const char *threat_label)
     }
     uint64_t body_len = (uint64_t)fs.QuadPart;
 
+    /* U-09: the body is authenticated in a single GCM call, so it must fit
+     * in memory; refuse oversized files instead of failing halfway through
+     * a partial encryption. */
+    if (body_len > Q_MAX_BODY_LEN) {
+        CloseHandle(fin);
+        CloseHandle(fout);
+        DeleteFileW(fos_path_w(&dst));
+        log_security_warning("quarantine refused: file exceeds the 500 MB body cap");
+        return RESP_ERR_IO;
+    }
+
     /* --- Encrypt metadata --- */
     size_t path_len = strlen(src_path);
     size_t label_len = strlen(threat_label);
@@ -754,69 +735,46 @@ int response_quarantine_file(const char *src_path, const char *threat_label)
     }
 
     if (ok == 0 && body_len > 0) {
-        /* CNG chained multi-part GCM: intermediate calls carry
-         * BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG and must be block-aligned;
-         * the final call clears the flag and computes the tag that
-         * authenticates the entire body. */
-        uint8_t mac_ctx[Q_TAG_LEN];
-        uint8_t iv_ctx[16];
-        memset(iv_ctx, 0, sizeof(iv_ctx));
-
-        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
-        BCRYPT_INIT_AUTH_MODE_INFO(info);
-        info.pbNonce = nonce_body;
-        info.cbNonce = sizeof(nonce_body);
-        info.pbAuthData = aad;
-        info.cbAuthData = sizeof(aad);
-        info.pbTag = body_tag;
-        info.cbTag = sizeof(body_tag);
-        info.pbMacContext = mac_ctx;
-        info.cbMacContext = sizeof(mac_ctx);
-
-        uint8_t *chunk_in = (uint8_t *)malloc(Q_READ_BUFFER_SIZE);
-        uint8_t *chunk_out = (uint8_t *)malloc(Q_READ_BUFFER_SIZE);
-        if (chunk_in == NULL || chunk_out == NULL) {
+        /* U-09: single-shot authenticated encryption. The body is bounded by
+         * Q_MAX_BODY_LEN (checked above), so buffer it fully and let one
+         * BCryptEncrypt call authenticate the whole message — no hand-rolled
+         * chained-GCM alignment/flag handling to get wrong. */
+        uint8_t *body_plain = (uint8_t *)malloc((size_t)body_len);
+        uint8_t *body_cipher = (uint8_t *)malloc((size_t)body_len);
+        if (body_plain == NULL || body_cipher == NULL) {
             ok = -1;
         }
-        uint64_t remaining = body_len;
-        while (ok == 0 && remaining > 0) {
-            DWORD chunk = (remaining > Q_READ_BUFFER_SIZE)
-                              ? (DWORD)Q_READ_BUFFER_SIZE : (DWORD)remaining;
-            int last = (chunk == remaining);
-            if (!last) {
-                chunk = (chunk / 16) * 16; /* intermediate calls must be aligned */
-                info.dwFlags = BCRYPT_AUTH_MODE_CHAIN_CALLS_FLAG;
-            } else {
-                info.dwFlags = 0;
+        if (ok == 0) {
+            uint64_t off = 0;
+            while (off < body_len) {
+                DWORD want = (body_len - off > Q_READ_BUFFER_SIZE)
+                                 ? (DWORD)Q_READ_BUFFER_SIZE
+                                 : (DWORD)(body_len - off);
+                DWORD got = 0;
+                if (!ReadFile(fin, body_plain + off, want, &got, NULL) ||
+                    got != want) {
+                    ok = -1;
+                    break;
+                }
+                off += got;
             }
-            DWORD got = 0;
-            if (!ReadFile(fin, chunk_in, chunk, &got, NULL) || got != chunk) {
-                ok = -1;
-                break;
-            }
-            ULONG cb = 0;
-            NTSTATUS s = BCryptEncrypt(bkey, chunk_in, got, &info,
-                                       iv_ctx, sizeof(iv_ctx),
-                                       chunk_out, got, &cb, 0);
-            if (s != 0) {
-                ok = -1;
-                break;
-            }
-            DWORD wrote = 0;
-            if (cb != got || !WriteFile(fout, chunk_out, cb, &wrote, NULL) || wrote != cb) {
-                ok = -1;
-                break;
-            }
-            remaining -= got;
+        }
+        if (ok == 0 && gcm_encrypt_stream(bkey, nonce_body, aad, sizeof(aad),
+                                          body_plain, (size_t)body_len,
+                                          body_cipher, body_tag) != 0) {
+            ok = -1;
         }
         if (ok == 0) {
             DWORD wrote = 0;
-            if (!WriteFile(fout, body_tag, sizeof(body_tag), &wrote, NULL) || wrote != sizeof(body_tag)) {
+            if (!WriteFile(fout, body_cipher, (DWORD)body_len, &wrote, NULL) ||
+                wrote != (DWORD)body_len ||
+                !WriteFile(fout, body_tag, sizeof(body_tag), &wrote, NULL) ||
+                wrote != sizeof(body_tag)) {
                 ok = -1;
             }
         }
-        free(chunk_in);
-        free(chunk_out);
+        free(body_plain);
+        free(body_cipher);
     }
     if (ok == 0 && !FlushFileBuffers(fout)) {
         ok = -1;
@@ -982,6 +940,13 @@ int response_restore_file(const char *q_path, const char *dest_override)
     if (!ReadFile(fin, meta_cipher, meta_cipher_len, &got, NULL) || got != meta_cipher_len ||
         !ReadFile(fin, meta_tag, sizeof(meta_tag), &got, NULL) || got != sizeof(meta_tag) ||
         !ReadFile(fin, &body_len, 8, &got, NULL) || got != 8) {
+        free(meta_cipher);
+        CloseHandle(fin);
+        return RESP_ERR_FORMAT;
+    }
+    /* U-09: the decrypt path buffers the whole body; refuse absurd header
+     * lengths before they become a huge allocation. */
+    if (body_len > Q_MAX_BODY_LEN) {
         free(meta_cipher);
         CloseHandle(fin);
         return RESP_ERR_FORMAT;

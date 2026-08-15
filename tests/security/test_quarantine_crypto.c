@@ -157,7 +157,34 @@ static void test_tampered_meta_rejected(void) {
   find_latest_vir();
   TEST_ASSERT_TRUE(g_last_vir[0] != 0);
 
-  /* flip a byte in the encrypted metadata region (after magic+version+nonces) */
+  /* flip a byte INSIDE the encrypted metadata ciphertext: the header is
+   * [magic(4)][version(4)][nonce_meta(12)][nonce_body(12)][meta_cipher_len(4)]
+   * followed by the ciphertext itself — offset 64 is safely inside it. */
+  {
+    FILE *f = fopen(g_last_vir, "r+b");
+    TEST_ASSERT_NOT_NULL(f);
+    fseek(f, 64, SEEK_SET);
+    unsigned char b = 0;
+    fread(&b, 1, 1, f);
+    fseek(f, -1, SEEK_CUR);
+    b ^= 0x40;
+    fwrite(&b, 1, 1, f);
+    fclose(f);
+  }
+  TEST_ASSERT_EQUAL_INT(RESP_ERR_TAMPERED, response_restore_file(g_last_vir, NULL));
+  DeleteFileA(g_last_vir);
+}
+
+static void test_corrupt_meta_length_rejected(void) {
+  make_file(g_src, 4096, 13);
+  TEST_ASSERT_EQUAL_INT(0, response_quarantine_file(g_src, "Test.TamperMetaLen"));
+  find_latest_vir();
+  TEST_ASSERT_TRUE(g_last_vir[0] != 0);
+
+  /* Corrupt the meta_cipher_len HEADER field (offset 32). The layout no
+   * longer parses, so a FORMAT refusal is expected (and equally safe);
+   * U-09 additionally bounds body_len, so absurd lengths cannot become
+   * huge allocations. */
   {
     FILE *f = fopen(g_last_vir, "r+b");
     TEST_ASSERT_NOT_NULL(f);
@@ -169,7 +196,9 @@ static void test_tampered_meta_rejected(void) {
     fwrite(&b, 1, 1, f);
     fclose(f);
   }
-  TEST_ASSERT_EQUAL_INT(RESP_ERR_TAMPERED, response_restore_file(g_last_vir, NULL));
+  int rc = response_restore_file(g_last_vir, NULL);
+  TEST_ASSERT_TRUE_MESSAGE(rc == RESP_ERR_FORMAT || rc == RESP_ERR_TAMPERED,
+                           "corrupt meta length must be refused (format or tamper)");
   DeleteFileA(g_last_vir);
 }
 
@@ -207,6 +236,7 @@ int main(void) {
   RUN_TEST(test_restore_to_override);
   RUN_TEST(test_tampered_body_rejected);
   RUN_TEST(test_tampered_meta_rejected);
+  RUN_TEST(test_corrupt_meta_length_rejected);
   RUN_TEST(test_restore_nonexistent_fails);
   RUN_TEST(test_quarantine_missing_file_fails);
   delete_vir_artifacts();

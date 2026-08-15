@@ -21,17 +21,17 @@
  * ========================================================================== */
 
 /**
- * @brief Heuristic score thresholds.
+ * @brief Decision thresholds.
  *
- * These thresholds determine how heuristic scores are interpreted:
- *   - HEURISTIC_HIGH_RISK (90+): Very suspicious, potential malware
- *   - HEURISTIC_MED_RISK (50-89): Suspicious, warrants monitoring
- *   - Below 50: Likely benign
+ * Shared with heuristic_engine.h so the verdict classification and the
+ * response action can never drift apart (they previously disagreed at
+ * 45 vs 50 for the "suspicious / monitor" gate).
+ *   - HEURISTIC_SCORE_MALICIOUS (90+): Very suspicious, potential malware
+ *   - HEURISTIC_SCORE_SUSPICIOUS (45+): Suspicious, warrants monitoring
+ *   - Below 45: Likely benign
  *
- * @note High threshold (90) is conservative to reduce false positives.
+ * @note The high threshold (90) is conservative to reduce false positives.
  */
-#define HEURISTIC_HIGH_RISK     90
-#define HEURISTIC_MED_RISK      50
 
 /**
  * @brief ML score threshold for triggering a response.
@@ -99,7 +99,7 @@ void execute_scan_decision(
      * unsigned files trigger quarantine; signed files are only monitored
      * to prevent breaking legitimate software.
      */
-    if (heur != NULL && heur->score >= HEURISTIC_HIGH_RISK) {
+    if (heur != NULL && heur->score >= HEURISTIC_SCORE_MALICIOUS) {
         if (trust == TRUST_NONE) {
             /* Unsigned file with very high risk score -> Quarantine */
             set_decision(out, ACTION_QUARANTINE, "High-risk heuristic (unsigned file)");
@@ -134,7 +134,7 @@ void execute_scan_decision(
      * Files with medium heuristic scores on unsigned files are monitored
      * for potential suspicious activity.
      */
-    if (heur != NULL && heur->score >= HEURISTIC_MED_RISK && trust == TRUST_NONE) {
+    if (heur != NULL && heur->score >= HEURISTIC_SCORE_SUSPICIOUS && trust == TRUST_NONE) {
         set_decision(out, ACTION_MONITOR, "Medium-risk heuristic (monitoring)");
         return;
     }

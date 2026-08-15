@@ -117,7 +117,11 @@ typedef enum {
     UPDATE_ERR_PYTHON_FAILED,     /**< Python script exited non-zero              */
     UPDATE_ERR_PYTHON_TIMEOUT,    /**< Python script exceeded timeout             */
     UPDATE_ERR_HMAC_WRITE,        /**< DB integrity file could not be written     */
-    UPDATE_ERR_SCRIPT_TAMPERED    /**< I-19: staged script hash != build-time pin */
+    UPDATE_ERR_SCRIPT_TAMPERED,   /**< I-19: staged script hash != build-time pin */
+    UPDATE_ERR_PYTHON_UNTRUSTED,  /**< U-06: python.exe failed Authenticode/PSF
+                                       signer verification                        */
+    UPDATE_ERR_SCRIPT_DIR_DIRTY   /**< U-06b: extra .py module beside the staged
+                                       script (sys.path[0] shadowing plant)       */
 } UpdateErrorCode;
 
 int signature_db_validate_file(const char *sigdb_path);

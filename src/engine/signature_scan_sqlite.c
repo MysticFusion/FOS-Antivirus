@@ -15,6 +15,27 @@
  * Database Initialization
  * ========================================================================== */
 
+/**
+ * @brief Percent-encode the characters SQLite treats specially in URI
+ *        filenames ('%', '?', '#') so a database path containing them cannot
+ *        alter the mode/fragment part of the URI.
+ */
+static void build_readonly_uri(const char *db_path, char *out, size_t out_sz) {
+    size_t o = 0;
+    int n = snprintf(out, out_sz, "file:");
+    if (n < 0 || (size_t)n >= out_sz) { out[0] = '\0'; return; }
+    o = (size_t)n;
+    for (const char *p = db_path; *p != '\0' && o + 4 < out_sz; p++) {
+        if (*p == '%' || *p == '?' || *p == '#') {
+            o += (size_t)snprintf(out + o, out_sz - o, "%%%02X",
+                                  (unsigned char)*p);
+        } else {
+            out[o++] = *p;
+        }
+    }
+    snprintf(out + o, out_sz - o, "?mode=ro");
+}
+
 SigHashDb* sig_db_open(const char *db_path) {
     if (db_path == NULL)
         return NULL;
@@ -29,9 +50,9 @@ SigHashDb* sig_db_open(const char *db_path) {
 
     /* Use sqlite3_open with URI filename + readonly flag for read-only access */
     char uri[1024];
-    snprintf(uri, sizeof(uri), "file:%s?mode=ro", db_path);
-    
-    int rc = sqlite3_open_v2(uri, &db->db, 
+    build_readonly_uri(db_path, uri, sizeof(uri));
+
+    int rc = sqlite3_open_v2(uri, &db->db,
                              SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
     if (rc != SQLITE_OK) {
         sqlite3_close(db->db);
@@ -160,8 +181,8 @@ int sig_db_validate(const char *db_path) {
 
     sqlite3 *db;
     char uri[1024];
-    snprintf(uri, sizeof(uri), "file:%s?mode=ro", db_path);
-    
+    build_readonly_uri(db_path, uri, sizeof(uri));
+
     int rc = sqlite3_open_v2(uri, &db, 
                              SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, NULL);
     if (rc != SQLITE_OK) {

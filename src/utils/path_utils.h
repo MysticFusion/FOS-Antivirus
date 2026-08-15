@@ -72,6 +72,34 @@ bool fos_delete_file(const fos_path_t *p);
 /** @brief _wfopen wrapper; mode is a C-style "rb"/"wb"/"ab"/... string. */
 FILE *fos_fopen(const fos_path_t *p, const char *mode);
 
+/**
+ * @brief MAPv3 U-03/U-04: atomically open a path and resolve its canonical
+ *        final path from the opened handle.
+ *
+ * Closes the check-then-open (TOCTOU, CWE-367) window: the object is opened
+ * IMMEDIATELY with CreateFileW and the returned path is derived from that
+ * handle via GetFinalPathNameByHandleW — never from a later re-check. The
+ * caller passes the canonical path (or the handle) downstream.
+ *
+ * @param wide_path      UTF-16 path to open (long-path prefix accepted).
+ * @param follow_reparse true  -> follow reparse points at open time; the
+ *                              returned path is the fully-resolved target
+ *                              path (use for leaf files).
+ *                       false -> FILE_FLAG_OPEN_REPARSE_POINT; the returned
+ *                              path is the link object's own path (use for
+ *                              directory walking where following would let
+ *                              a junction escape the scan root).
+ * @param out_utf8       canonical path as UTF-8 with the "\\?\" /
+ *                       "\\?\UNC\" prefix stripped (conventional form).
+ * @param out_sz         size of out_utf8 in bytes.
+ * @param was_reparse    optional; set to true when the opened object is
+ *                       itself a reparse point (decided atomically via the
+ *                       handle, not stale find-data).
+ * @return 0 on success, -1 on any open/resolve failure.
+ */
+int fos_open_canonical(const wchar_t *wide_path, bool follow_reparse,
+                       char *out_utf8, size_t out_sz, bool *was_reparse);
+
 #ifdef __cplusplus
 }
 #endif

@@ -4,6 +4,7 @@
  */
 #define _CRT_SECURE_NO_WARNINGS
 #include "scan_core.h"
+#include "amsi_scan.h"
 #include "feature_extract.h"
 #include "fs_enumerator.h"
 #include "hash_util.h"
@@ -128,6 +129,42 @@ static bool is_extension_allowed(const char *path)
     return false;
 }
 
+/* U-10: script-type content that registered AMSI providers (Defender's
+ * script engine, etc.) can evaluate far better than static heuristics. */
+static bool is_script_path(const char *path)
+{
+    if (!path) return false;
+    const char *ext = PathFindExtensionA(path);
+    if (!ext || *ext == '\0') return false;
+    static const char *k_script_exts[] = {
+        ".js", ".jse", ".vbs", ".vbe", ".ps1", ".bat", ".cmd",
+        ".hta", ".wsf", ".wsh", ".py", NULL
+    };
+    char ext_low[16]; strncpy_s(ext_low, sizeof(ext_low), ext, _TRUNCATE); _strlwr_s(ext_low, sizeof(ext_low));
+    for (int i = 0; k_script_exts[i]; i++)
+        if (strcmp(ext_low, k_script_exts[i]) == 0) return true;
+    return false;
+}
+
+/* U-10: submit script content to the platform's AMSI providers. A provider
+ * DETECTION is treated like the strongest static signal: the file is scored
+ * malicious. The decision engine still applies trust dampening, so signed
+ * detections are monitored rather than quarantined. */
+static void apply_amsi_verdict(const fos_path_t *fp, const char *utf8_path,
+                               HeuristicResult *heur)
+{
+    if (amsi_scan_file_wide(fp, NULL) != AMSI_SCAN_MALWARE) return;
+
+    heur->score = 100;
+    heur->verdict = VERDICT_MALICIOUS;
+    size_t used = strlen(heur->explanation);
+    if (used < sizeof(heur->explanation) - 1) {
+        strncat(heur->explanation, " AMSI-malicious;",
+                sizeof(heur->explanation) - used - 1);
+    }
+    (void)utf8_path;
+}
+
 static void scan_task_free(ScanTask *t){ if(!t) return; free(t->path); free(t); }
 
 static void finish_task(void)
@@ -195,6 +232,7 @@ static void scan_single_file_internal(const char *path, ScanReason reason, bool 
     if (sig.matched) {
         g_mutex_lock(&global_scan_ctx.mutex);
         global_scan_ctx.threats_found++;
+        global_scan_ctx.files_scanned++;
         g_mutex_unlock(&global_scan_ctx.mutex);
         scan_report_submit_complete(input, &sig, &heur, ml_score);
         finish_task();
@@ -206,14 +244,19 @@ static void scan_single_file_internal(const char *path, ScanReason reason, bool 
         if (trust == TRUST_NONE) ml_score = ml_engine_scan(&input->features);
     }
 
+    /* U-10: script files go through the platform's AMSI providers. */
+    if (is_script_path(path)) {
+        apply_amsi_verdict(&fp, path, &heur);
+    }
+
     /* MAP-10: double-extension files (invoice.pdf.exe) get an additive
-     * risk score; re-derive the verdict against the same thresholds used
-     * by the heuristic engine. */
+     * risk score; re-derive the verdict against the shared thresholds from
+     * heuristic_engine.h. */
     if (has_suspicious_double_ext(path)) {
         heur.score += HEUR_DOUBLE_EXT_SCORE;
-        if (heur.score >= 90) {
+        if (heur.score >= HEURISTIC_SCORE_MALICIOUS) {
             heur.verdict = VERDICT_MALICIOUS;
-        } else if (heur.score >= 45) {
+        } else if (heur.score >= HEURISTIC_SCORE_SUSPICIOUS) {
             heur.verdict = VERDICT_SUSPICIOUS;
         }
         size_t used = strlen(heur.explanation);
