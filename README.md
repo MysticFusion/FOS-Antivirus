@@ -20,10 +20,11 @@ It is a learning tool and a research prototype. It is **not** a production antiv
 - **Tiered Detection Pipeline** —
   1. SHA-256 signature lookup against a SQLite database of **1.1M+ known malware hashes**;
   2. Rule-based **heuristic scoring** of file characteristics and behaviors;
-  3. **Machine-learning classification** using a bundled decision-forest model built based on Ember 2024 PE Dataset.
+  3. **Machine-learning classification** using a bundled decision-forest model built based on Ember 2024 PE Dataset;
+  4. **AMSI script scanning** — script files (.ps1/.js/.vbs/.hta/...) are submitted to the OS's registered AMSI providers, so obfuscated script content is evaluated by the platform's script engines.
 - **Digital Signature Trust** — evaluates file signatures (e.g., Microsoft-signed binaries) to reduce false positives.
 - **Automatic Remediation** — quarantines detected threats into an isolated folder and keeps a full detection/quarantine history with restore support.
-- **Signature Database Updates** — one-click in-app update that aggregates malware hashes from five public, no-authentication threat-intelligence sources (MalwareBazaar, URLhaus, ThreatFox, ESET malware-ioc, TweetFeed).
+- **Signature Database Updates** — one-click in-app update that aggregates malware hashes from five public, no-authentication threat-intelligence sources (MalwareBazaar, URLhaus, ThreatFox, ESET malware-ioc, TweetFeed). The update pipeline is defense-in-depth: the aggregator script is SHA-256-pinned at build time, the Python interpreter must be Authenticode-signed by the Python Software Foundation, it runs with `-E` (environment isolation), and the resulting database is HMAC-SHA256-integrity-checked at load.
 - **Native GTK4 Desktop UI** — dashboard, scan controls, settings, update management, and detection history.
 - **Unit Test** — automated decision-policy test built alongside the main application.
 
